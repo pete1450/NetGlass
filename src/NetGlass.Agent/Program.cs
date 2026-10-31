@@ -6,7 +6,8 @@
 // by double-clicking it the first time.
 //
 // Collectors:
-//   Linux:   /proc/net/* + /proc/<pid>/fd + /proc/<pid>/{stat,cmdline,exe,status,cgroup}
+//   Linux:   per-network-namespace /proc/<pid>/net/* + /proc/<pid>/fd
+//            (host namespace alone misses Docker container traffic)
 //   Windows: netstat -ano parsed + Process enrichment (+ WMI parent, best effort)
 // Sender: POST snapshot to the server every interval (default 2s).
 // Kill:   polls the server for kill requests, re-verifies PID + exe +
@@ -29,11 +30,22 @@ var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
 _ = Task.Run(() => KillLoop(http, config, cts.Token));
+var lastLoggedCount = -1;
+var snapshotNo = 0;
 while (!cts.IsCancellationRequested)
 {
     try
     {
         var snapshot = Collector.Collect();
+        snapshotNo++;
+        // Log on change, and every 30 snapshots (~60s at 2s), so
+        // `docker logs netglass-agent` shows whether the agent is
+        // actually seeing traffic, without spamming every poll.
+        if (snapshot.Count != lastLoggedCount || snapshotNo % 30 == 0)
+        {
+            Console.WriteLine($"[netglass-agent] snapshot #{snapshotNo}: {snapshot.Count} connections" + (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? $", {Collector.LastNamespaceCount} net namespaces, {Collector.LastFailedNamespaces} failed namespace reads" : ""));
+            lastLoggedCount = snapshot.Count;
+        }
         var payload = new
         {
             hostname = Dns.GetHostName(),
@@ -281,6 +293,9 @@ sealed record CollectedConnection(
 
 static class Collector
 {
+    public static int LastNamespaceCount;
+    public static int LastFailedNamespaces;
+
     public static List<CollectedConnection> Collect() =>
         RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? LinuxCollect() : WindowsCollect();
 
@@ -288,23 +303,53 @@ static class Collector
     private static List<CollectedConnection> LinuxCollect()
     {
         var procRoot = Environment.GetEnvironmentVariable("PROC_ROOT") ?? "/proc";
-        var rows = new List<(string Proto, string Local, string Remote, string State, int Inode)>();
-        foreach (var (file, proto) in new[] { ("tcp", "tcp"), ("tcp6", "tcp"), ("udp", "udp"), ("udp6", "udp") })
+        // Network namespaces: each Docker container (unless it uses host
+        // networking) has its own net namespace, so /proc/net/* alone only
+        // shows the host namespace. That was the v1 bug: container services
+        // were invisible. Group PIDs by /proc/<pid>/ns/net, read each
+        // namespace once via a representative PID, deduplicate by inode.
+        var nsToPid = new Dictionary<string, int>();
+        foreach (var dir in Directory.EnumerateDirectories(procRoot).Where(d => int.TryParse(Path.GetFileName(d), out _)))
         {
-            var path = Path.Combine(procRoot, "net", file);
-            if (!File.Exists(path)) continue;
-            var isV6 = file.EndsWith("6");
-            foreach (var line in File.ReadLines(path).Skip(1))
+            try
             {
-                var parts = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length < 10) continue;
-                if (!int.TryParse(parts[3], System.Globalization.NumberStyles.HexNumber, null, out var stateNo)) continue;
-                if (!int.TryParse(parts[9], out var inode)) continue;
-                var state = proto == "tcp" ? TcpState(stateNo) : stateNo == 1 ? "ESTABLISHED" : "UNCONNECTED";
-                rows.Add((proto, Addr(parts[1], isV6), Addr(parts[2], isV6), state, inode));
+                var ns = new FileInfo(Path.Combine(dir, "ns", "net")).LinkTarget ?? "";
+                if (!string.IsNullOrEmpty(ns) && !nsToPid.ContainsKey(ns))
+                    nsToPid[ns] = int.Parse(Path.GetFileName(dir));
+            }
+            catch { }
+        }
+        LastNamespaceCount = nsToPid.Count;
+        LastFailedNamespaces = 0;
+        var rows = new List<(string Namespace, string Proto, string Local, string Remote, string State, int Inode)>();
+        var seenSockets = new HashSet<string>();
+        void ReadNetDir(string netDir, string ns)
+        {
+            foreach (var (file, proto) in new[] { ("tcp", "tcp"), ("tcp6", "tcp"), ("udp", "udp"), ("udp6", "udp") })
+            {
+                var path = Path.Combine(netDir, file);
+                if (!File.Exists(path)) continue;
+                var isV6 = file.EndsWith("6");
+                try
+                {
+                    foreach (var line in File.ReadLines(path).Skip(1))
+                    {
+                        var parts = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                        if (parts.Length < 10) continue;
+                        if (!int.TryParse(parts[3], System.Globalization.NumberStyles.HexNumber, null, out var stateNo)) continue;
+                        if (!int.TryParse(parts[9], out var inode)) continue;
+                        if (!seenSockets.Add($"{proto}|{inode}")) continue;
+                        var state = proto == "tcp" ? TcpState(stateNo) : stateNo == 1 ? "ESTABLISHED" : "UNCONNECTED";
+                        rows.Add((ns, proto, Addr(parts[1], isV6), Addr(parts[2], isV6), state, inode));
+                    }
+                }
+                catch { LastFailedNamespaces++; }
             }
         }
-        var listenPorts = rows.Where(r => r.State == "LISTEN").Select(r => (r.Proto, PortOf(r.Local))).ToHashSet();
+        ReadNetDir(Path.Combine(procRoot, "net"), "host");
+        foreach (var (ns, repPid) in nsToPid)
+            ReadNetDir(Path.Combine(procRoot, repPid.ToString(), "net"), ns);
+        var listenPorts = rows.Where(r => r.State == "LISTEN").Select(r => (r.Namespace, r.Proto, PortOf(r.Local))).ToHashSet();
         var inodeToPid = new Dictionary<int, int>();
         foreach (var dir in Directory.EnumerateDirectories(procRoot).Where(d => int.TryParse(Path.GetFileName(d), out _)))
         {
@@ -342,7 +387,7 @@ static class Collector
                 direction = "listen";
             else if (r.Remote.StartsWith("127.0.0.1:") || r.Remote.StartsWith("[::1]:") || RemoteIp(r.Remote) == LocalIp(r.Local))
                 direction = "local";
-            else if (listenPorts.Contains((r.Proto, localPort))) direction = "inbound";
+            else if (listenPorts.Contains((r.Namespace, r.Proto, localPort))) direction = "inbound";
             else direction = "outbound";
             var parent = info is not null && info.Ppid > 0 ? Proc(info.Ppid) : null;
             var containerName = info is not null && !string.IsNullOrEmpty(info.ContainerId)

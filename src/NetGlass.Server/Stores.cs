@@ -334,6 +334,12 @@ public static class ComposeGenerator
                 pid: host
                 cap_add:
                   - SYS_PTRACE
+                # Docker's default AppArmor profile can block reading
+                # other processes' /proc/<pid>/fd and /proc/<pid>/net,
+                # which is exactly what the agent does. Without this,
+                # host and container processes silently show as (unknown).
+                security_opt:
+                  - apparmor:unconfined
                 environment:
                   - NETGLASS_SERVER={url}
                   - NETGLASS_TOKEN={token}

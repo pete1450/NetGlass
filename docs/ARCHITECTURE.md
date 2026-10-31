@@ -39,7 +39,10 @@
   If no server/token is found, the agent prompts interactively on
   startup and saves the answers — this is the "set server IP/port
   on startup" Windows behaviour, and it works the same on Linux.
-- Linux collector: `/proc/net/{tcp,tcp6,udp,udp6}` +
+- Linux collector: one `/proc/<pid>/net/{tcp,tcp6,udp,udp6}` read per
+  network namespace (PIDs grouped by `/proc/<pid>/ns/net`, deduplicated
+  by socket inode) — the host namespace alone misses Docker container
+  traffic, which lives in each container's own namespace — plus
   `/proc/<pid>/fd` socket-inode mapping + `/proc/<pid>/{stat,cmdline,exe,status,cgroup}`.
   This is a direct port of the SocketWatch prototype logic, in C#.
 - Windows collector: `netstat -ano` (TCP + UDP) parsed, enriched
