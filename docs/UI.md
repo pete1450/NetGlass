@@ -118,6 +118,14 @@ sketchy happening, and if so, what exactly is it?"
   views. All previous features are preserved: sortable columns,
   detail drawer with kill + IP info, agent delete, pause, recordings,
   compose copy/download.
+- **Mobile (≤900px / ≤600px):** the sidebar collapses to a top bar
+  with a small logo and wrapping nav buttons, stats go two per row,
+  search/dropdowns go full-width, the 10-column table scrolls
+  horizontally inside its own wrapper instead of forcing the whole
+  page sideways (no columns hidden), inputs use 16px to stop iOS
+  zoom-on-focus, touch targets are at least 40–44px, and the detail
+  drawer becomes a bottom sheet (full-width, 85vh max) instead of a
+  420px panel hanging off-screen.
 - **Delete agent (Agents panel, `DELETE /api/agents/{id}`):** two-click
   confirm in the UI. Revokes the agent's token, drops its live/ghost
   rows, and deletes its SQLite agent row, pending kill requests, and

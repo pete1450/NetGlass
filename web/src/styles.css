@@ -3,4 +3,38 @@ a{color:#93c5fd}
 button{background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;cursor:pointer}
 button.primary{background:#1d4ed8;border-color:#1d4ed8}
 button.danger{background:#7f1d1d;border-color:#991b1b}
-input,select,textarea{background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 8px}
+input,select,textarea{background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 8px;max-width:100%;box-sizing:border-box}
+img,svg{max-width:100%}
+
+/* Table: never let a 10-column table force the whole page sideways.
+   On narrow screens it scrolls inside its own wrapper, so the
+   sidebar, stats and filters stay put and the user swipes the table. */
+.ng-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.ng-table-wrap table{min-width:900px}
+
+/* ---- Mobile: sidebar becomes a top bar, everything stacks -------- */
+@media (max-width: 900px){
+  .ng-layout{flex-direction:column !important}
+  .ng-sidebar{width:auto !important;flex-direction:row !important;flex-wrap:wrap !important;align-items:center !important;border-right:none !important;border-bottom:1px solid #1e293b !important;padding:12px !important;gap:12px !important}
+  .ng-logo{display:flex !important;align-items:center !important;gap:10px !important;margin-bottom:0 !important}
+  .ng-logo svg{width:40px !important;height:40px !important}
+  .ng-logo>div{font-size:20px !important;margin-top:0 !important}
+  .ng-nav{flex-direction:row !important;flex-wrap:wrap !important;flex:1 !important}
+  .ng-nav button{width:auto !important;padding:8px 10px !important;font-size:14px !important}
+  .ng-footer{display:none !important}
+  .ng-main{padding:12px !important}
+  .ng-main h1{font-size:26px !important}
+  /* Stats: two per row instead of seven squeezed into one line */
+  .ng-stats>button{flex:1 1 42% !important}
+  /* Filters: search and dropdowns go full-width, no 240px min-width overflow */
+  .ng-filters input,.ng-filters select{flex:1 1 100% !important;min-width:0 !important}
+  .ng-filters button{min-height:44px}
+  button{min-height:40px}
+  input,select,textarea{font-size:16px} /* stops iOS zooming on focus */
+}
+
+@media (max-width: 600px){
+  /* Detail drawer becomes a bottom sheet, not a 420px panel hanging off-screen */
+  .ng-drawer{left:0 !important;right:0 !important;top:auto !important;bottom:0 !important;width:auto !important;max-height:85vh !important;border-radius:16px 16px 0 0 !important}
+  .ng-stats>button{flex:1 1 42% !important;padding:10px !important}
+}

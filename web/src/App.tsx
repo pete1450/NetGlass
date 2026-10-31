@@ -249,10 +249,10 @@ export default function App() {
   )
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh', background: 'linear-gradient(160deg, #04091c 0%, #0a1930 60%, #071224 100%)', color: '#e2e8f0', fontFamily: 'system-ui, sans-serif' }}>
+    <div className="ng-layout" style={{ display: 'flex', minHeight: '100vh', background: 'linear-gradient(160deg, #04091c 0%, #0a1930 60%, #071224 100%)', color: '#e2e8f0', fontFamily: 'system-ui, sans-serif' }}>
       {/* Sidebar, as in the reference screenshot */}
-      <aside style={{ width: 230, flexShrink: 0, padding: 20, borderRight: '1px solid #1e293b', background: 'rgba(4, 12, 28, 0.7)', display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <div style={{ marginBottom: 12 }}>
+      <aside className="ng-sidebar" style={{ width: 230, flexShrink: 0, padding: 20, borderRight: '1px solid #1e293b', background: 'rgba(4, 12, 28, 0.7)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div className="ng-logo" style={{ marginBottom: 12 }}>
           <svg width="72" height="72" viewBox="0 0 72 72" aria-label="NetGlass logo">
             <g stroke="#38bdf8" strokeWidth="1.5" opacity="0.9">
               <line x1="14" y1="14" x2="36" y2="26" /><line x1="58" y1="14" x2="36" y2="26" />
@@ -266,21 +266,23 @@ export default function App() {
           </svg>
           <div style={{ fontSize: 26, fontWeight: 800, marginTop: 4 }}>Net<span style={{ color: '#22d3ee' }}>Glass</span></div>
         </div>
+        <div className="ng-nav" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {navItem('agents', 'Agents', '▣')}
         {navItem('recordings', 'Recordings', '▶')}
         {navItem('settings', 'Settings', '⚙')}
         {navItem('about', 'About', 'ⓘ')}
-        <div style={{ marginTop: 'auto', fontSize: 12, color: '#64748b' }}>
+        </div>
+        <div className="ng-footer" style={{ marginTop: 'auto', fontSize: 12, color: '#64748b' }}>
           Local-first. No cloud.<br />Agents report to this server only.
         </div>
       </aside>
 
-      <main style={{ flex: 1, minWidth: 0, padding: 20, maxWidth: 1500 }}>
+      <main className="ng-main" style={{ flex: 1, minWidth: 0, padding: 20, maxWidth: 1500 }}>
       <h1 style={{ margin: '0 0 4px', fontSize: 34 }}>Net<span style={{ color: '#22d3ee' }}>Glass</span></h1>
       <p style={{ color: '#94a3b8', marginTop: 0 }}>Local-first process network visibility. No cloud. Click a row for the full story, including how to kill it.</p>
 
       {nav === 'agents' && (<>
-      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
+      <div className="ng-stats" style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
         {([
           ['Total', counts.total, '🖥'], ['Outbound', counts.outbound, '✓'], ['Inbound', counts.inbound, '←'],
           ['Listeners', counts.listen, '👥'], ['Suspicious', conns.filter(c => c.suspicious).length, '⬡'],
@@ -309,7 +311,7 @@ export default function App() {
         </div>
       )}
 
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12, alignItems: 'center' }}>
+      <div className="ng-filters" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12, alignItems: 'center' }}>
         {([['all', 'All'], ['outgoing', 'Outgoing'], ['incoming', 'Incoming'], ['suspicious', 'Suspicious']] as const).map(([key, label]) => (
           <button key={key} onClick={() => setView(key)} disabled={view === key} style={{ background: view === key ? '#2563eb' : '#0d1b33', color: '#fff', border: '1px solid #1e3a5f', borderRadius: 10, padding: '8px 14px', cursor: 'pointer' }}>{label}</button>
         ))}
@@ -403,6 +405,7 @@ export default function App() {
         </div>
       )}
 
+      <div className="ng-table-wrap">
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
         <thead><tr>
           {COLUMNS.map(col => (
@@ -431,6 +434,7 @@ export default function App() {
           {filtered.length === 0 && <tr><td colSpan={10} style={{ padding: 12, color: '#94a3b8' }}>No connections match. Connect an agent, or clear the filters.</td></tr>}
         </tbody>
       </table>
+      </div>
       </>)}
 
       {nav === 'recordings' && (
@@ -493,7 +497,7 @@ export default function App() {
       )}
 
       {selected && (
-        <div style={{ position: 'fixed', right: 16, top: 16, bottom: 16, width: 420, overflow: 'auto', background: '#0d1b33', border: '1px solid #2563eb', borderRadius: 12, padding: 16 }}>
+        <div className="ng-drawer" style={{ position: 'fixed', right: 16, top: 16, bottom: 16, width: 420, overflow: 'auto', background: '#0d1b33', border: '1px solid #2563eb', borderRadius: 12, padding: 16 }}>
           <button onClick={() => setSelected(null)} style={{ float: 'right' }}>Close (Esc)</button>
           <h2 style={{ marginTop: 0 }}>{selected.process} <span style={{ fontSize: 14, color: '#94a3b8' }}>pid {selected.pid ?? ''}</span></h2>
           <p><strong>{selected.direction}</strong> {selected.proto} {selected.state}<br />{selected.local} → {selected.remote || '—'}{selected.remoteHost ? ` (${selected.remoteHost})` : ''}</p>
