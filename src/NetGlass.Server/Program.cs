@@ -11,11 +11,13 @@ builder.Services.AddSingleton(sp =>
     new RecordingStore(
         Environment.GetEnvironmentVariable("NETGLASS_DB") ?? "netglass.db"));
 builder.Services.AddSingleton<AppriseNotifier>();
+builder.Services.AddSingleton<ReverseDnsService>();
 
 var app = builder.Build();
 var store = app.Services.GetRequiredService<ConnectionStore>();
 var recordings = app.Services.GetRequiredService<RecordingStore>();
 var notifier = app.Services.GetRequiredService<AppriseNotifier>();
+var dns = app.Services.GetRequiredService<ReverseDnsService>();
 
 // ---- agents (in-memory, backed by SQLite) -------------------------------
 var agents = new ConcurrentDictionary<string, AgentInfo>();
@@ -43,6 +45,23 @@ AgentInfo? AuthAgent(string id, HttpRequest req)
     return token == agent.Token ? agent : null;
 }
 
+// Fill RemoteHost from the PTR cache, and kick off a local background
+// PTR lookup for any IP not yet cached. Never blocks on DNS: the
+// hostname appears on the next poll once cached.
+List<ConnectionDto> WithHosts(List<ConnectionDto> conns)
+{
+    var outList = new List<ConnectionDto>(conns.Count);
+    foreach (var c in conns)
+    {
+        var ip = IpHelpers.ParseIp(c.Remote);
+        if (ip is null) { outList.Add(c); continue; }
+        var host = dns.GetCached(ip);
+        if (host is not null) outList.Add(c with { RemoteHost = host });
+        else { dns.EnsureResolved(ip); outList.Add(c); }
+    }
+    return outList;
+}
+
 // ---- agent registration + compose generator -----------------------------
 app.MapPost("/api/agents", (JsonElement body) =>
 {
@@ -61,6 +80,22 @@ app.MapPost("/api/agents", (JsonElement body) =>
 app.MapGet("/api/agents", () =>
     Results.Json(agents.Values.Select(a => new
         { a.Id, a.Name, a.Hostname, a.Os, a.Version, a.LastSeen, a.SocketCount })));
+
+// Delete an agent: revoke its token, drop its live/ghost rows, and
+// remove its SQLite row, pending kill requests, and seen-keys (so a
+// re-registered agent's connections show as NEW again). Recordings
+// and alerts are audit history and are kept. An agent that is still
+// running will get 401 on its next snapshot until it is re-registered.
+app.MapDelete("/api/agents/{id}", (string id) =>
+{
+    if (!agents.TryRemove(id, out _)) return Results.NotFound();
+    store.RemoveAgent(id);
+    using var conn = recordings.Open();
+    conn.Execute("DELETE FROM agents WHERE id = $id", ("$id", id));
+    conn.Execute("DELETE FROM kill_requests WHERE agent_id = $id", ("$id", id));
+    conn.Execute("DELETE FROM seen_keys WHERE key LIKE $p", ("$p", id + "|%"));
+    return Results.Ok(new { deleted = id });
+});
 
 app.MapGet("/api/agents/{id}/compose", (string id, string? serverUrl, string? image) =>
 {
@@ -136,7 +171,7 @@ app.MapPost("/api/agents/{id}/snapshot", async (string id, SnapshotRequest snap,
         }
     }
 
-    try { await hub.Clients.All.SendAsync("connections", store.All(now)); } catch { }
+    try { await hub.Clients.All.SendAsync("connections", WithHosts(store.All(now))); } catch { }
     return Results.Ok(new { accepted = live.Count });
 });
 
@@ -155,7 +190,7 @@ bool FrequencyTriggered(AlertRuleDto rule, ConnectionDto c, DateTime now)
 // ---- live view ----------------------------------------------------------
 app.MapGet("/api/connections", (string? agent, string? direction) =>
 {
-    var all = store.All(DateTime.UtcNow);
+    var all = WithHosts(store.All(DateTime.UtcNow));
     if (!string.IsNullOrWhiteSpace(agent)) all = all.Where(c => c.AgentId == agent).ToList();
     if (!string.IsNullOrWhiteSpace(direction)) all = all.Where(c => c.Direction == direction).ToList();
     return Results.Json(new { generated_at = DateTime.UtcNow, connections = all,
@@ -302,6 +337,74 @@ app.MapGet("/api/alerts", () =>
         list.Add(new { at = reader.GetString(0), rule = reader.GetString(1),
             message = reader.GetString(2), agent = reader.GetString(3), detail = reader.GetString(4) });
     return Results.Json(list);
+});
+
+// ---- IP info (ip-api.com, ON DEMAND only) ------------------------------
+// GET returns only what is already cached — it never calls ip-api.
+// POST fetches from ip-api, caches for 30 days, and returns the result.
+// Private/special IPs are never sent to ip-api. Free tier is 45/min
+// over HTTP only, so this keeps a small in-memory window and stops at
+// 40/min, leaving headroom. No API key is needed for the free tier.
+var ipApiCalls = new List<DateTime>();
+var ipApiGate = new object();
+
+app.MapGet("/api/ip-info", (string? ip) =>
+{
+    if (string.IsNullOrWhiteSpace(ip) || !System.Net.IPAddress.TryParse(ip, out _))
+        return Results.BadRequest(new { error = "Provide a valid ?ip=" });
+    if (!IpHelpers.IsPublic(ip))
+        return Results.Json(new { ip, isPublic = false, cached = false, message = "Private, loopback, or reserved IP — no public enrichment available." });
+    var cached = recordings.GetIpInfo(ip);
+    if (cached is null || cached.ExpiresAt <= DateTime.UtcNow)
+        return Results.Json(new { ip, isPublic = true, cached = false });
+    return Results.Json(cached);
+});
+
+app.MapPost("/api/ip-info", async (string? ip, bool? force) =>
+{
+    if (string.IsNullOrWhiteSpace(ip) || !System.Net.IPAddress.TryParse(ip, out _))
+        return Results.BadRequest(new { error = "Provide a valid ?ip=" });
+    if (!IpHelpers.IsPublic(ip))
+        return Results.BadRequest(new { error = "Private, loopback, or reserved IP — no public enrichment available." });
+    var now = DateTime.UtcNow;
+    var cached = recordings.GetIpInfo(ip);
+    if (force != true && cached is not null && cached.ExpiresAt > now)
+        return Results.Json(cached);
+    lock (ipApiGate)
+    {
+        ipApiCalls.RemoveAll(t => now - t > TimeSpan.FromMinutes(1));
+        if (ipApiCalls.Count >= 40)
+            return Results.Json(new { error = "ip-api.com free-tier rate limit reached (40/min guard). Try again in a minute — cached results are still available." }, statusCode: 429);
+        ipApiCalls.Add(now);
+    }
+    // Free tier is HTTP only (HTTPS is a paid feature); this is public
+    // IP metadata, not credentials or private traffic.
+    var url = $"http://ip-api.com/json/{Uri.EscapeDataString(ip)}?fields=status,message,query,reverse,isp,org,as,country,countryCode,regionName,city,zip,timezone";
+    try
+    {
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+        var resp = await http.GetAsync(url);
+        if (!resp.IsSuccessStatusCode)
+            return Results.Json(new { error = $"ip-api.com returned {(int)resp.StatusCode}." }, statusCode: 502);
+        var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        var root = doc.RootElement;
+        Func<string, string> Str = name => root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
+        if (Str("status") != "success")
+            return Results.Json(new { error = $"ip-api.com: {Str("message")}" }, statusCode: 502);
+        var info = new IpInfoDto(ip, Str("isp"), Str("org"), Str("as"), Str("country"),
+            Str("countryCode"), Str("regionName"), Str("city"), Str("timezone"),
+            Str("reverse"), now, now.AddDays(30), false);
+        recordings.SetIpInfo(info);
+        // ip-api's reverse field is a useful PTR fallback: fill the
+        // hostname cache with it, so the table shows it too.
+        if (!string.IsNullOrEmpty(info.Reverse))
+            recordings.SetDns(ip, info.Reverse, "ip-api", now.AddHours(24));
+        return Results.Json(info);
+    }
+    catch (Exception ex)
+    {
+        return Results.Json(new { error = $"ip-api.com lookup failed: {ex.Message}" }, statusCode: 502);
+    }
 });
 
 app.MapHub<LiveHub>("/hubs/live");

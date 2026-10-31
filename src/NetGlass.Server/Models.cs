@@ -42,3 +42,11 @@ public sealed record RecordingDto(
 public sealed record RecordingEventDto(
     long Seq, DateTime At, string EventType, string AgentName,
     string Direction, string Process, string Exe, string Local, string Remote);
+
+// On-demand ip-api.com enrichment, cached server-side. Never fetched
+// automatically: the UI only calls POST /api/ip-info when the user
+// clicks Fetch for a specific IP.
+public sealed record IpInfoDto(
+    string Ip, string Isp, string Org, string As, string Country,
+    string CountryCode, string Region, string City, string Timezone,
+    string Reverse, DateTime FetchedAt, DateTime ExpiresAt, bool FromCache);

@@ -83,6 +83,15 @@ public sealed class ConnectionStore
         return (live, closed);
     }
 
+    // Delete an agent's live/ghost rows. Recordings and alerts are
+    // history and are kept; they store only the agent name, not the id.
+    public void RemoveAgent(string agentId)
+    {
+        foreach (var (key, entry) in _entries)
+            if (entry.Conn.AgentId == agentId)
+                _entries.TryRemove(key, out _);
+    }
+
     public List<ConnectionDto> All(DateTime now)
     {
         var cutoff = now.AddSeconds(-LingerSeconds);
@@ -126,7 +135,9 @@ public sealed class RecordingStore
             CREATE TABLE IF NOT EXISTS rules(id TEXT PRIMARY KEY, name TEXT, type TEXT, pattern TEXT, threshold INTEGER, window_minutes INTEGER, enabled INTEGER);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS kill_requests(id TEXT PRIMARY KEY, agent_id TEXT, pid INTEGER, exe TEXT, started TEXT, reason TEXT, status TEXT, created_at TEXT, result TEXT);
-            CREATE TABLE IF NOT EXISTS seen_keys(key TEXT PRIMARY KEY, first_seen TEXT);");
+            CREATE TABLE IF NOT EXISTS seen_keys(key TEXT PRIMARY KEY, first_seen TEXT);
+            CREATE TABLE IF NOT EXISTS dns_cache(ip TEXT PRIMARY KEY, hostname TEXT, source TEXT, resolved_at TEXT, expires_at TEXT);
+            CREATE TABLE IF NOT EXISTS ip_info_cache(ip TEXT PRIMARY KEY, isp TEXT, org TEXT, asn TEXT, country TEXT, country_code TEXT, region TEXT, city TEXT, timezone TEXT, reverse TEXT, fetched_at TEXT, expires_at TEXT);");
     }
 
     public SqliteConnection Open()
@@ -259,6 +270,58 @@ public sealed class RecordingStore
         using var conn = Open();
         conn.Execute("INSERT INTO settings VALUES ($k, $v) ON CONFLICT(key) DO UPDATE SET value = $v",
             ("$k", key), ("$v", value));
+    }
+
+    // ---- DNS / IP-info cache -------------------------------------------
+    // dns_cache.hostname may be "" for a negative (no PTR) entry; the
+    // caller distinguishes that from "no entry" by the expires_at check.
+    public (string Hostname, DateTime ExpiresAt)? GetDns(string ip)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT hostname, expires_at FROM dns_cache WHERE ip = $ip";
+        cmd.Parameters.AddWithValue("$ip", ip);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read()) return null;
+        return (reader.GetString(0), DateTime.Parse(reader.GetString(1)));
+    }
+
+    public void SetDns(string ip, string hostname, string source, DateTime expiresAt)
+    {
+        using var conn = Open();
+        conn.Execute(@"INSERT INTO dns_cache VALUES ($ip, $h, $s, $r, $e)
+            ON CONFLICT(ip) DO UPDATE SET hostname = $h, source = $s, resolved_at = $r, expires_at = $e",
+            ("$ip", ip), ("$h", hostname), ("$s", source),
+            ("$r", DateTime.UtcNow.ToString("O")), ("$e", expiresAt.ToString("O")));
+    }
+
+    public IpInfoDto? GetIpInfo(string ip)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = @"SELECT isp, org, asn, country, country_code, region, city,
+            timezone, reverse, fetched_at, expires_at FROM ip_info_cache WHERE ip = $ip";
+        cmd.Parameters.AddWithValue("$ip", ip);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read()) return null;
+        return new IpInfoDto(ip, reader.GetString(0), reader.GetString(1), reader.GetString(2),
+            reader.GetString(3), reader.GetString(4), reader.GetString(5), reader.GetString(6),
+            reader.GetString(7), reader.GetString(8), DateTime.Parse(reader.GetString(9)),
+            DateTime.Parse(reader.GetString(10)), true);
+    }
+
+    public void SetIpInfo(IpInfoDto info)
+    {
+        using var conn = Open();
+        conn.Execute(@"INSERT INTO ip_info_cache VALUES
+            ($ip, $isp, $org, $asn, $c, $cc, $r, $city, $tz, $rev, $f, $e)
+            ON CONFLICT(ip) DO UPDATE SET isp = $isp, org = $org, asn = $asn,
+            country = $c, country_code = $cc, region = $r, city = $city,
+            timezone = $tz, reverse = $rev, fetched_at = $f, expires_at = $e",
+            ("$ip", info.Ip), ("$isp", info.Isp), ("$org", info.Org), ("$asn", info.As),
+            ("$c", info.Country), ("$cc", info.CountryCode), ("$r", info.Region),
+            ("$city", info.City), ("$tz", info.Timezone), ("$rev", info.Reverse),
+            ("$f", info.FetchedAt.ToString("O")), ("$e", info.ExpiresAt.ToString("O")));
     }
 }
 

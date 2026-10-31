@@ -102,3 +102,38 @@ sketchy happening, and if so, what exactly is it?"
 - Onboarding empty state: if no agents are connected, the page is
   the Add Agent flow, not an empty table. The first run should end
   with a live row in under five minutes.
+
+## Layout (as reworked from the reference screenshot)
+
+- Left sidebar (230px, dark navy) with a NetGlass network/magnifier
+  logo and nav: Agents, Recordings, Settings, About.
+- Agents page: 7 stat cards with icons (Total, Outbound, Inbound,
+  Listeners, Suspicious, New 24h, Ghosts) + Add agent + Pause, pill
+  view filters (All / Outgoing / Incoming / Suspicious), search,
+  agent + direction dropdowns, Only new / Only suspicious checkboxes,
+  Only listeners toggle, and a Ghost linger slider — then the Add
+  agent panel, Recording panel, Agents panel, and the sortable table.
+- Recordings, Settings (ghost linger, live-update pause, Apprise
+  URLs/API URL, LAN-trust note) and About are their own sidebar
+  views. All previous features are preserved: sortable columns,
+  detail drawer with kill + IP info, agent delete, pause, recordings,
+  compose copy/download.
+- **Delete agent (Agents panel, `DELETE /api/agents/{id}`):** two-click
+  confirm in the UI. Revokes the agent's token, drops its live/ghost
+  rows, and deletes its SQLite agent row, pending kill requests, and
+  seen-keys. Recordings and alerts are kept as history. A still-running
+  agent gets 401 on its next snapshot until it is re-registered.
+- **Pause live updates:** stops the UI's 2s polling, so the displayed
+  table freezes and rows stop shifting while you inspect one. A banner
+  shows the snapshot time. The server, agents, recordings and alerts
+  keep running, so resuming shows the latest state and nothing is
+  lost. Explicit actions (delete, add agent, recording, linger) still
+  refresh immediately.
+- **Reverse DNS + on-demand IP info:** the server fills `remoteHost`
+  from a local PTR lookup (cached 24h, 1h for "no PTR"), done in the
+  background so snapshots never block on DNS. ip-api.com enrichment
+  (ISP, org, ASN, country, city, timezone, reverse) is only fetched
+  when the user clicks Fetch in a connection's detail drawer, for
+  that one IP, and is then cached for 30 days (Refresh forces a
+  re-fetch). Private IPs are never sent to ip-api, and GET
+  `/api/ip-info` only reads the cache — it never calls ip-api.
