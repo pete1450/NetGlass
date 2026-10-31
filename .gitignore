@@ -1,0 +1,10 @@
+bin/
+obj/
+out/
+node_modules/
+dist/
+*.db
+*.db-journal
+agent.json
+.DS_Store
+*.tsbuildinfo

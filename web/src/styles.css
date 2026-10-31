@@ -1,0 +1,6 @@
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0f172a;color:#e2e8f0;margin:0}
+a{color:#93c5fd}
+button{background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;cursor:pointer}
+button.primary{background:#1d4ed8;border-color:#1d4ed8}
+button.danger{background:#7f1d1d;border-color:#991b1b}
+input,select,textarea{background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 8px}

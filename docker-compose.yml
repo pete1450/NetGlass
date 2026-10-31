@@ -1,0 +1,23 @@
+# NetGlass server. One container. LAN only in v1 (no login yet).
+#   docker compose up -d --build
+#   open http://<server-lan-ip>:8080
+services:
+  netglass-server:
+    build:
+      context: ..
+      dockerfile: deploy/server.Dockerfile
+    image: ghcr.io/pete1450/netglass-server:latest
+    container_name: netglass-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - ASPNETCORE_URLS=http://+:8080
+      - NETGLASS_DB=/data/netglass.db
+      # Optional Apprise: set APPRISE_URLS in the UI instead, or here.
+      # - APPRISE_API_URL=http://your-apprise-api:8080/notify
+    volumes:
+      - netglass-data:/data
+
+volumes:
+  netglass-data:

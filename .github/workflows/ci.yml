@@ -1,0 +1,61 @@
+name: NetGlass CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: '8.0.x' }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm, cache-dependency-path: web/package-lock.json }
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+      - name: Build server
+        run: dotnet build src/NetGlass.Server/NetGlass.Server.csproj -c Release
+      - name: Build agent
+        run: dotnet build src/NetGlass.Agent/NetGlass.Agent.csproj -c Release
+      - name: Publish Windows agent
+        run: dotnet publish src/NetGlass.Agent/NetGlass.Agent.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o out/win-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NetGlass.Agent-win-x64
+          path: out/win-x64/NetGlass.Agent.exe
+
+  docker:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/server.Dockerfile
+          push: true
+          tags: ghcr.io/pete1450/netglass-server:latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/agent.Dockerfile
+          push: true
+          tags: ghcr.io/pete1450/netglass-agent:latest
