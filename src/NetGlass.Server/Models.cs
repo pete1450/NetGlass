@@ -6,6 +6,10 @@ public sealed record AgentInfo(
     string Id, string Name, string Hostname, string Os, string Version,
     string Token, DateTime LastSeen, int SocketCount);
 
+public sealed record FindingDto(
+    string RuleId, string Title, string Category, string Engine,
+    string Severity, int Score, string Evidence, string Explanation);
+
 public sealed record ConnectionDto(
     string AgentId, string AgentName,
     string Direction, string Proto, string State,
@@ -15,7 +19,8 @@ public sealed record ConnectionDto(
     string Unit, string Container, string ContainerId,
     DateTime? Started, DateTime FirstSeen, DateTime LastSeen,
     bool IsGhost, bool IsNew, bool Suspicious, string[] Flags,
-    string Detail = "");
+    string Detail = "", string Signature = "unknown",
+    int Score = 0, string Tier = "None", FindingDto[]? Findings = null);
 
 public sealed record SnapshotConnection(
     string Direction, string Proto, string State,
@@ -23,7 +28,7 @@ public sealed record SnapshotConnection(
     int? Pid, string Process, string Exe, string Cmdline, string User,
     int? Ppid, string Parent, string ParentExe,
     string Unit, string Container, string ContainerId,
-    DateTime? Started, string Detail = "");
+    DateTime? Started, string Detail = "", string Signature = "unknown");
 
 public sealed record SnapshotRequest(
     string Hostname, string Os, string Version,

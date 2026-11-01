@@ -337,7 +337,7 @@ sealed record CollectedConnection(
     int? Pid, string Process, string Exe, string Cmdline, string User,
     int? Ppid, string Parent, string ParentExe,
     string Unit, string Container, string ContainerId, DateTime? Started,
-    string Detail = "");
+    string Detail = "", string Signature = "unknown");
 
 static class Collector
 {
@@ -625,6 +625,28 @@ static class Collector
     private static string RemoteIp(string addr) => LocalIp(addr);
 
     // ---- Windows: netstat -ano ----
+    private static readonly Dictionary<string, string> _sigCache = new(StringComparer.OrdinalIgnoreCase);
+    private static string SignatureFor(string exe)
+    {
+        // Windows only. Authenticode certificate presence, not full
+        // chain validation: CreateFromSignedFile throws
+        // CryptographicException when the file has no certificate.
+        // Linux never calls this — signature is "unknown" there,
+        // and the unsigned check skips unknown.
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || string.IsNullOrEmpty(exe)) return "unknown";
+        if (_sigCache.TryGetValue(exe, out var cached)) return cached;
+        string result;
+        try
+        {
+            _ = System.Security.Cryptography.X509Certificates.X509Certificate.CreateFromSignedFile(exe);
+            result = "signed";
+        }
+        catch (System.Security.Cryptography.CryptographicException) { result = "unsigned"; }
+        catch { result = "unknown"; }
+        _sigCache[exe] = result;
+        return result;
+    }
+
     private static List<CollectedConnection> WindowsCollect()
     {
         var result = new List<CollectedConnection>();
@@ -674,7 +696,7 @@ static class Collector
                 }
                 catch { }
                 result.Add(new CollectedConnection(direction, proto.ToLowerInvariant(), state, local, remote,
-                    pid, name, exe, "", "", ppid, parentName, parentExe, "", "", "", started));
+                    pid, name, exe, "", "", ppid, parentName, parentExe, "", "", "", started, "", SignatureFor(exe)));
             }
         }
         return result;

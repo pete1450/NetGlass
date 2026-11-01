@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Text;
 using Microsoft.Data.Sqlite;
+using NetGlass.Server.Checks;
 
 namespace NetGlass.Server;
 
@@ -21,6 +22,7 @@ public sealed class ConnectionStore
 
     private readonly ConcurrentDictionary<string, Entry> _entries = new();
     public int LingerSeconds { get; set; } = 30;
+    private readonly CheckHistory _history = new();
 
     public static string Key(string agentId, SnapshotConnection c) =>
         $"{agentId}|{c.Proto}|{c.Direction}|{c.Exe}|{c.Local}|{c.Remote}";
@@ -28,10 +30,28 @@ public sealed class ConnectionStore
     public static string KeyOf(ConnectionDto c) =>
         $"{c.AgentId}|{c.Proto}|{c.Direction}|{c.Exe}|{c.Local}|{c.Remote}";
 
+    private ConnectionDto ScoreDto(ConnectionDto dto, DateTime now, IReadOnlyList<ConnectionDto> live,
+        Func<string, bool> isFirstEver, Func<string, bool> isCheckEnabled,
+        Func<string, (string Country, string Asn)?> cachedIp)
+    {
+        var (score, tier, findings) = CheckEngine.Evaluate(dto, now, _history, isFirstEver,
+            Providers.ThreatList(), cachedIp, live, isCheckEnabled);
+        return dto with
+        {
+            Score = score, Tier = tier,
+            Findings = findings.Select(f => new FindingDto(f.RuleId, f.Title, f.Category, f.Engine,
+                f.Severity, f.Score, f.Evidence, f.Explanation)).ToArray(),
+        };
+    }
+
     public (List<ConnectionDto> Live, List<string> ClosedKeys) Ingest(
         AgentInfo agent, SnapshotRequest snapshot, DateTime now,
-        Func<string, DateTime, bool> isNew)
+        Func<string, DateTime, bool> isNew, Func<string, bool> isFirstEver,
+        Func<string, bool> isCheckEnabled,
+        Func<string, (string Country, string Asn)?> cachedIp)
     {
+        var previousLiveKeys = _entries.Where(kv => kv.Value.Conn.AgentId == agent.Id && kv.Value.Live)
+            .Select(kv => kv.Key).ToHashSet();
         var seenKeys = new HashSet<string>();
         var live = new List<ConnectionDto>();
         foreach (var c in snapshot.Connections)
@@ -44,13 +64,29 @@ public sealed class ConnectionStore
             if (c.Exe.StartsWith("/tmp/") || c.Exe.StartsWith("/dev/shm/") || c.Exe.StartsWith("/var/tmp/"))
                 flags.Add("TMP_EXE");
             if (c.Exe.EndsWith(" (deleted)")) flags.Add("DELETED_EXE");
+            // Public / uncommon / no-exe flags, previously only in
+            // the UI's Attention definition but never emitted here.
+            // Now emitted so checks and Attention actually see them.
+            if (c.Direction == "listen")
+            {
+                var lip = c.Local.Contains(':') ? c.Local[..c.Local.LastIndexOf(':')].Trim('[', ']') : c.Local;
+                if (lip == "0.0.0.0" || lip == "::") flags.Add("PUBLIC");
+            }
+            if (string.IsNullOrEmpty(c.Exe) || c.Process == "(unknown)") flags.Add("NO_EXE");
+            {
+                var addr = c.Direction == "listen" ? c.Local : c.Remote;
+                var li = addr.LastIndexOf(':');
+                if (li >= 0 && int.TryParse(addr[(li + 1)..], out var p) && p != 0 &&
+                    !NetGlass.Server.Checks.Providers.WellKnownPorts.Contains(p))
+                    flags.Add("UNCOMMON_PORT");
+            }
             var suspicious = flags.Contains("TMP_EXE") || flags.Contains("DELETED_EXE");
             var dto = new ConnectionDto(
                 agent.Id, agent.Name, c.Direction, c.Proto, c.State,
                 c.Local, c.Remote, "", c.Pid, c.Process, c.Exe, c.Cmdline, c.User,
                 c.Ppid, c.Parent, c.ParentExe, c.Unit, c.Container, c.ContainerId,
                 c.Started, now, now, false, flags.Contains("NEW"), suspicious,
-                flags.ToArray(), c.Detail ?? "");
+                flags.ToArray(), c.Detail ?? "", c.Signature ?? "unknown");
             if (_entries.TryGetValue(key, out var existing))
             {
                 dto = existing.Conn with
@@ -58,6 +94,7 @@ public sealed class ConnectionStore
                     LastSeen = now, IsGhost = false, State = c.State,
                     Pid = c.Pid, Process = c.Process, Cmdline = c.Cmdline,
                     Detail = string.IsNullOrEmpty(c.Detail) ? existing.Conn.Detail : c.Detail,
+                    Signature = c.Signature is null or "unknown" ? existing.Conn.Signature : c.Signature,
                 };
                 existing.Conn = dto;
                 existing.Live = true;
@@ -81,7 +118,23 @@ public sealed class ConnectionStore
                 closed.Add(key);
             }
         }
-        return (live, closed);
+
+        // Behavior history first (session starts = absent -> live),
+        // then score live rows, then score newly-closed ghosts
+        // (so ghost-specific checks fire on the ghost row itself).
+        _history.Record(live, previousLiveKeys, now);
+        var scored = live.Select(d => ScoreDto(d, now, live, isFirstEver, isCheckEnabled, cachedIp)).ToList();
+        for (var i = 0; i < scored.Count; i++)
+        {
+            var key = KeyOf(scored[i]);
+            if (_entries.TryGetValue(key, out var entry)) entry.Conn = scored[i];
+        }
+        foreach (var key in closed)
+        {
+            if (!_entries.TryGetValue(key, out var entry)) continue;
+            entry.Conn = ScoreDto(entry.Conn, now, scored, isFirstEver, isCheckEnabled, cachedIp);
+        }
+        return (scored, closed);
     }
 
     // Delete an agent's live/ghost rows. Recordings and alerts are
@@ -137,6 +190,7 @@ public sealed class RecordingStore
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS kill_requests(id TEXT PRIMARY KEY, agent_id TEXT, pid INTEGER, exe TEXT, started TEXT, reason TEXT, status TEXT, created_at TEXT, result TEXT);
             CREATE TABLE IF NOT EXISTS seen_keys(key TEXT PRIMARY KEY, first_seen TEXT);
+            CREATE TABLE IF NOT EXISTS baselines(key TEXT PRIMARY KEY, first_seen TEXT);
             CREATE TABLE IF NOT EXISTS dns_cache(ip TEXT PRIMARY KEY, hostname TEXT, source TEXT, resolved_at TEXT, expires_at TEXT);
             CREATE TABLE IF NOT EXISTS ip_info_cache(ip TEXT PRIMARY KEY, isp TEXT, org TEXT, asn TEXT, country TEXT, country_code TEXT, region TEXT, city TEXT, timezone TEXT, reverse TEXT, fetched_at TEXT, expires_at TEXT);");
     }
@@ -165,6 +219,76 @@ public sealed class RecordingStore
             ins.ExecuteNonQuery();
             return true;
         }
+    }
+
+    // First-ever baselines for checks. In-memory cached, persisted
+    // in baselines(). On first use, seeded from seen_keys so that
+    // upgrading NetGlass does NOT flag every existing exe/destination
+    // as "first ever" — only things that appear after the upgrade.
+    // Key formats (must match Checks/*):
+    //   exe:{agent}|{exe}, dest:{agent}|{remoteIp},
+    //   dest-global:{remoteIp}, proc-dest:{agent}|{exe}|{remoteIp},
+    //   listen-new/listen-high:{agent}|{exe}|{local},
+    //   proc-port:{agent}|{exe}|{port}, udp:{agent}|{exe}|{ip}|{port}
+    private HashSet<string>? _baselineKeys;
+    public bool IsFirstEver(string key, DateTime now)
+    {
+        lock (_gate)
+        {
+            if (_baselineKeys is null)
+            {
+                _baselineKeys = new HashSet<string>();
+                using var conn = Open();
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT key FROM baselines";
+                    using var r = cmd.ExecuteReader();
+                    while (r.Read()) _baselineKeys.Add(r.GetString(0));
+                }
+                // Seed from seen_keys: key = agent|proto|direction|exe|local|remote
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT key FROM seen_keys";
+                    using var r = cmd.ExecuteReader();
+                    while (r.Read())
+                    {
+                        var parts = r.GetString(0).Split('|');
+                        if (parts.Length != 6) continue;
+                        var (agent, direction, exe, local, remote) = (parts[0], parts[2], parts[3], parts[4], parts[5]);
+                        var rip = remote.Contains(':') ? remote[..remote.LastIndexOf(':')].Trim('[', ']') : remote;
+                        _baselineKeys.Add($"exe:{agent}|{exe}");
+                        _baselineKeys.Add($"dest:{agent}|{rip}");
+                        _baselineKeys.Add($"dest-global:{rip}");
+                        _baselineKeys.Add($"proc-dest:{agent}|{exe}|{rip}");
+                        if (direction == "listen") { _baselineKeys.Add($"listen-new:{agent}|{exe}|{local}"); _baselineKeys.Add($"listen-high:{agent}|{exe}|{local}"); }
+                    }
+                }
+            }
+            if (_baselineKeys.Contains(key)) return false;
+            _baselineKeys.Add(key);
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "INSERT OR IGNORE INTO baselines VALUES ($k, $t)";
+            cmd.Parameters.AddWithValue("$k", key);
+            cmd.Parameters.AddWithValue("$t", now.ToString("O"));
+            cmd.ExecuteNonQuery();
+            return true;
+        }
+    }
+
+    public (string Country, string Asn)? GetCachedIpInfo(string ip)
+    {
+        try
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT country, asn FROM ip_info_cache WHERE ip = $ip";
+            cmd.Parameters.AddWithValue("$ip", ip);
+            using var r = cmd.ExecuteReader();
+            if (!r.Read()) return null;
+            return (r.IsDBNull(0) ? "" : r.GetString(0), r.IsDBNull(1) ? "" : r.GetString(1));
+        }
+        catch { return null; }
     }
 
     public string? CurrentRecordingId()

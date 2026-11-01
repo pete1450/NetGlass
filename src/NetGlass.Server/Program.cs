@@ -38,6 +38,20 @@ if (int.TryParse(lingerSetting, out var linger)) store.LingerSeconds = linger;
 var ruleLastAlert = new ConcurrentDictionary<string, DateTime>();
 var frequencyHits = new ConcurrentDictionary<string, List<DateTime>>();
 
+// Modular checks: enabled by default, toggled via /api/checks.
+// Loaded from settings at startup, kept in memory so Ingest does
+// not do a DB query per check per connection.
+var checkEnabled = new ConcurrentDictionary<string, bool>(
+    NetGlass.Server.Checks.CheckEngine.All.ToDictionary(c => c.Id, _ => true));
+using (var conn = recordings.Open())
+using (var cmd = conn.CreateCommand())
+{
+    cmd.CommandText = "SELECT key, value FROM settings WHERE key LIKE 'check_enabled:%'";
+    using var reader = cmd.ExecuteReader();
+    while (reader.Read())
+        checkEnabled[reader.GetString(0)["check_enabled:".Length..]] = reader.GetString(1) != "0";
+}
+
 AgentInfo? AuthAgent(string id, HttpRequest req)
 {
     if (!agents.TryGetValue(id, out var agent)) return null;
@@ -118,7 +132,10 @@ app.MapPost("/api/agents/{id}/snapshot", async (string id, SnapshotRequest snap,
     agents[id] = agent;
 
     var (live, closedKeys) = store.Ingest(agent, snap, now,
-        (key, t) => recordings.IsNewKey(key, t));
+        (key, t) => recordings.IsNewKey(key, t),
+        key => recordings.IsFirstEver(key, now),
+        id => checkEnabled.GetValueOrDefault(id, true),
+        ip => recordings.GetCachedIpInfo(ip));
 
     // Recordings: seen + closed events, in order.
     var recordingId = recordings.CurrentRecordingId();
@@ -286,6 +303,28 @@ app.MapGet("/api/recordings/{id}/export", (string id) =>
 string Csv(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";
 
 // ---- rules + settings ---------------------------------------------------
+// Modular checks catalogue: every registered check, its category,
+// engine, severity, score, description, and whether it can run
+// here (threat-list checks report their missing list, etc.).
+app.MapGet("/api/checks", () =>
+{
+    var list = NetGlass.Server.Checks.CheckEngine.All.Select(c => new
+    {
+        id = c.Id, title = c.Title, category = c.Category, engine = c.Engine,
+        severity = c.Severity, score = c.Score, description = c.Description,
+        enabled = checkEnabled.GetValueOrDefault(c.Id, true),
+        unavailableReason = c.UnavailableReason,
+    });
+    return Results.Json(list);
+});
+app.MapPost("/api/checks/{id}/toggle", (string id, JsonElement body) =>
+{
+    if (!NetGlass.Server.Checks.CheckEngine.All.Any(c => c.Id == id)) return Results.NotFound();
+    var enabled = body.TryGetProperty("enabled", out var e) ? e.GetBoolean() : !checkEnabled.GetValueOrDefault(id, true);
+    checkEnabled[id] = enabled;
+    recordings.SetSetting($"check_enabled:{id}", enabled ? "1" : "0");
+    return Results.Json(new { id, enabled });
+});
 app.MapGet("/api/rules", () =>
 {
     using var conn = recordings.Open();

@@ -8,7 +8,17 @@ type Conn = {
   unit: string; container: string; containerId: string
   started?: string | null; firstSeen: string; lastSeen: string
   isGhost: boolean; isNew: boolean; suspicious: boolean; flags: string[]
-  detail?: string
+  detail?: string; signature?: string
+  score?: number; tier?: string; findings?: Finding[]
+}
+type Finding = {
+  ruleId: string; title: string; category: string; engine: string
+  severity: string; score: number; evidence: string; explanation: string
+}
+type CheckItem = {
+  id: string; title: string; category: string; engine: string
+  severity: string; score: number; description: string
+  enabled: boolean; unavailableReason?: string | null
 }
 type Agent = { id: string; name: string; hostname: string; os: string; version: string; lastSeen: string; socketCount: number }
 type Recording = { id: string; name: string; startedAt: string; endedAt?: string | null; eventCount: number }
@@ -28,11 +38,11 @@ function parseIp(addr: string): string | null {
   return null // unbracketed IPv6 with a port is ambiguous; bracketed form is what the agent sends
 }
 
-type SortKey = 'agentName' | 'direction' | 'process' | 'detail' | 'exe' | 'local' | 'remote' | 'state' | 'firstSeen' | 'lastSeen'
+type SortKey = 'agentName' | 'direction' | 'process' | 'score' | 'detail' | 'exe' | 'local' | 'remote' | 'state' | 'firstSeen' | 'lastSeen'
 
 const COLUMNS: { key: SortKey; label: string }[] = [
   { key: 'agentName', label: 'Agent' }, { key: 'direction', label: 'Direction' },
-  { key: 'process', label: 'Process' }, { key: 'detail', label: 'Detail' }, { key: 'exe', label: 'Executable' },
+  { key: 'process', label: 'Process' }, { key: 'score', label: 'Score' }, { key: 'detail', label: 'Detail' }, { key: 'exe', label: 'Executable' },
   { key: 'local', label: 'Local' }, { key: 'remote', label: 'Remote' },
   { key: 'state', label: 'State' }, { key: 'firstSeen', label: 'First seen' },
   { key: 'lastSeen', label: 'Last seen' },
@@ -55,12 +65,13 @@ export default function App() {
   const [agents, setAgents] = useState<Agent[]>([])
   const [recordings, setRecordings] = useState<Recording[]>([])
   const [alerts, setAlerts] = useState<AlertItem[]>([])
+  const [checks, setChecks] = useState<CheckItem[]>([])
   // Triage-first: Attention is the default view. It shows only rows
   // with a reason to care (suspicious, new, public, uncommon port).
   // All / flat is always one tap away, and the drawer still carries
   // the full detail for every row — nothing is hidden, only grouped.
   const [view, setView] = useState<'attention' | 'all' | 'outgoing' | 'incoming' | 'listeners' | 'suspicious'>('attention')
-  const [nav, setNav] = useState<'agents' | 'alerts' | 'manage' | 'recordings' | 'settings' | 'about'>('agents')
+  const [nav, setNav] = useState<'agents' | 'alerts' | 'checks' | 'manage' | 'recordings' | 'settings' | 'about'>('agents')
   const [grouped, setGrouped] = useState(true)
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
   const [showColumns, setShowColumns] = useState(false)
@@ -69,7 +80,7 @@ export default function App() {
       const saved = localStorage.getItem('ng-columns')
       if (saved) { const parsed = JSON.parse(saved) as string[]; const valid = parsed.filter(c => COLUMNS.some(col => col.key === c)) as SortKey[]; if (valid.length) return valid }
     } catch { /* fall through to defaults */ }
-    return ['agentName', 'direction', 'process', 'detail', 'remote']
+    return ['agentName', 'direction', 'process', 'score', 'detail', 'remote']
   })
   const [appriseUrls, setAppriseUrls] = useState('')
   const [appriseApiUrl, setAppriseApiUrl] = useState('')
@@ -95,14 +106,16 @@ export default function App() {
 
   const load = useCallback(async () => {
     try {
-      const [c, a, r, al] = await Promise.all([
+      const [c, a, r, al, ch] = await Promise.all([
         fetch('/api/connections').then(x => x.json()),
         fetch('/api/agents').then(x => x.json()),
         fetch('/api/recordings').then(x => x.json()),
         fetch('/api/alerts').then(x => x.json()).catch(() => []),
+        fetch('/api/checks').then(x => x.json()).catch(() => []),
       ])
       setConns(c.connections ?? []); setCounts(c.counts ?? {})
       setAgents(a ?? []); setRecordings(r ?? []); setAlerts(Array.isArray(al) ? al : [])
+      setChecks(Array.isArray(ch) ? ch : [])
       setLastUpdated(new Date())
     } catch { /* server down: keep last state, UI shows stale counts */ }
   }, [])
@@ -129,7 +142,8 @@ export default function App() {
   }, [])
 
   const isAttention = (c: Conn) =>
-    c.suspicious || c.isNew || c.flags.includes('PUBLIC') || c.flags.includes('UNCOMMON_PORT') ||
+    c.tier === 'High' || c.tier === 'Medium' || c.suspicious || c.isNew ||
+    c.flags.includes('PUBLIC') || c.flags.includes('UNCOMMON_PORT') ||
     c.flags.includes('TMP_EXE') || c.flags.includes('DELETED_EXE') || c.flags.includes('NO_EXE')
 
   const filtered = useMemo(() => {
@@ -145,6 +159,10 @@ export default function App() {
       rows = rows.filter(c => [c.process, c.exe, c.cmdline, c.remote, c.remoteHost, c.local, c.unit, c.container, c.agentName, String(c.pid ?? ''), c.detail ?? ''].join(' ').toLowerCase().includes(needle))
     }
     const sorted = [...rows].sort((a, b) => {
+      if (view === 'attention') {
+        const sd = (b.score ?? 0) - (a.score ?? 0)
+        if (sd !== 0) return sd
+      }
       const av = String((a as unknown as Record<string, unknown>)[sortKey] ?? '')
       const bv = String((b as unknown as Record<string, unknown>)[sortKey] ?? '')
       return av.localeCompare(bv) * sortDir
@@ -156,16 +174,16 @@ export default function App() {
   // Grouping is display-only — expanding a group shows its individual
   // sockets, and clicking any socket opens the full drawer.
   const groups = useMemo(() => {
-    const map = new Map<string, { key: string; agentName: string; process: string; detail: string; container: string; exe: string; count: number; suspicious: number; isNew: number; ghosts: number; listeners: number; remotes: Set<string>; rows: Conn[] }>()
+    const map = new Map<string, { key: string; agentName: string; process: string; detail: string; container: string; exe: string; count: number; suspicious: number; isNew: number; ghosts: number; listeners: number; maxScore: number; tier: string; remotes: Set<string>; rows: Conn[] }>()
     for (const c of filtered) {
       const key = `${c.agentId}|${c.process}|${c.detail || c.container || c.exe}`
-      const g = map.get(key) ?? { key, agentName: c.agentName, process: c.process, detail: c.detail ?? '', container: c.container, exe: c.exe, count: 0, suspicious: 0, isNew: 0, ghosts: 0, listeners: 0, remotes: new Set(), rows: [] }
-      g.count++; if (c.suspicious) g.suspicious++; if (c.isNew) g.isNew++; if (c.isGhost) g.ghosts++; if (c.direction === 'listen') g.listeners++
+      const g = map.get(key) ?? { key, agentName: c.agentName, process: c.process, detail: c.detail ?? '', container: c.container, exe: c.exe, count: 0, suspicious: 0, isNew: 0, ghosts: 0, listeners: 0, maxScore: 0, tier: 'None', remotes: new Set(), rows: [] }
+      g.count++; if (c.suspicious) g.suspicious++; if (c.isNew) g.isNew++; if (c.isGhost) g.ghosts++; if (c.direction === 'listen') g.listeners++; if ((c.score ?? 0) > g.maxScore) { g.maxScore = c.score ?? 0; g.tier = c.tier ?? 'None' }
       if (c.remote) g.remotes.add(c.remote)
       g.rows.push(c)
       map.set(key, g)
     }
-    return [...map.values()].sort((a, b) => (b.suspicious - a.suspicious) || (b.isNew - a.isNew) || (b.count - a.count))
+    return [...map.values()].sort((a, b) => (b.maxScore - a.maxScore) || (b.suspicious - a.suspicious) || (b.isNew - a.isNew) || (b.count - a.count))
   }, [filtered])
 
   const summary = useMemo(() => {
@@ -288,6 +306,7 @@ export default function App() {
       case 'agentName': return c.agentName
       case 'direction': return <>{c.direction}{c.isGhost ? ' (closed)' : ''}</>
       case 'process': return <><strong>{c.process}</strong> <span style={{ color: '#94a3b8' }}>pid {c.pid ?? ''}</span></>
+      case 'score': return (c.score ?? 0) > 0 ? <><strong style={{ color: c.tier === 'High' ? '#f87171' : c.tier === 'Medium' ? '#fbbf24' : '#94a3b8' }}>{c.score}</strong> <span style={{ color: '#94a3b8', fontSize: 12 }}>{c.tier}</span></> : '—'
       case 'detail': return <span style={{ color: c.detail ? '#e2e8f0' : '#64748b' }}>{c.detail || '—'}</span>
       case 'exe': return <span style={{ overflowWrap: 'anywhere' }}>{c.exe}</span>
       case 'local': return c.local
@@ -300,7 +319,7 @@ export default function App() {
   const rowStyle = (c: Conn): React.CSSProperties => ({
     background: c.suspicious ? '#450a0a' : c.isGhost ? '#1e293b' : undefined,
     opacity: c.isGhost ? 0.6 : 1, cursor: 'pointer',
-    borderLeft: c.suspicious ? '4px solid #ef4444' : isAttention(c) ? '4px solid #f59e0b' : '4px solid transparent',
+    borderLeft: c.tier === 'High' ? '4px solid #ef4444' : c.tier === 'Medium' ? '4px solid #f59e0b' : isAttention(c) ? '4px solid #f59e0b' : '4px solid transparent',
   })
   const openRow = (c: Conn) => { setSelected(c); setConfirmKill(false); setKillStatus('') }
 
@@ -340,6 +359,7 @@ export default function App() {
         <div className="ng-nav" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {navItem('agents', 'Agents', '▣')}
         {navItem('alerts', `Alerts${alerts.length ? ` (${alerts.length})` : ''}`, '⚠')}
+        {navItem('checks', 'Checks', '⬡')}
         {navItem('manage', 'Manage agents', '⚙')}
         {navItem('recordings', 'Recordings', '▶')}
         {navItem('settings', 'Settings', '⚙')}
@@ -409,14 +429,14 @@ export default function App() {
       </div>
       {showColumns && (
         <div style={{ ...card, marginBottom: 12 }}>
-          <strong>Columns</strong> <span style={{ color: '#94a3b8', fontSize: 12 }}>— defaults are Agent, Direction, Process, Detail, Remote. Everything else is always in the drawer.</span>
+          <strong>Columns</strong> <span style={{ color: '#94a3b8', fontSize: 12 }}>— defaults are Agent, Direction, Process, Score, Detail, Remote. Everything else is always in the drawer.</span>
           <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
             {COLUMNS.map(col => (
               <label key={col.key}><input type="checkbox" checked={visibleCols.includes(col.key)} onChange={e => setVisibleCols(v => e.target.checked ? [...v, col.key] : v.filter(c => c !== col.key))} /> {col.label}</label>
             ))}
           </div>
           <div style={{ marginTop: 8 }}>
-            <button onClick={() => setVisibleCols(['agentName', 'direction', 'process', 'detail', 'remote'])}>Reset to defaults</button>{' '}
+            <button onClick={() => setVisibleCols(['agentName', 'direction', 'process', 'score', 'detail', 'remote'])}>Reset to defaults</button>{' '}
             <button onClick={() => setVisibleCols(COLUMNS.map(c => c.key))}>Show all columns</button>
           </div>
         </div>
@@ -437,9 +457,10 @@ export default function App() {
           {groups.map(g => {
             const expanded = expandedGroups.has(g.key)
             return (
-              <div key={g.key} style={{ ...card, marginBottom: 8, borderLeft: g.suspicious ? '4px solid #ef4444' : (g.isNew ? '4px solid #f59e0b' : undefined) }}>
+              <div key={g.key} style={{ ...card, marginBottom: 8, borderLeft: g.tier === 'High' ? '4px solid #ef4444' : (g.tier === 'Medium' || g.isNew ? '4px solid #f59e0b' : undefined) }}>
                 <button onClick={() => setExpandedGroups(prev => { const next = new Set(prev); if (next.has(g.key)) next.delete(g.key); else next.add(g.key); return next })} style={{ background: 'transparent', border: 'none', color: '#e2e8f0', cursor: 'pointer', textAlign: 'left', width: '100%', padding: 0 }}>
                   <span style={{ fontSize: 16 }}>{expanded ? '▾' : '▸'} <strong>{g.process}</strong></span>{' '}
+                  {g.maxScore > 0 && <span style={{ color: g.tier === 'High' ? '#f87171' : '#fbbf24', fontWeight: 700 }}>{g.maxScore} ({g.tier})</span>}{' '}
                   <span style={{ color: '#94a3b8' }}>{g.agentName}{g.detail ? ` — ${g.detail}` : g.container ? ` — ${g.container}` : ''}</span>
                   <div style={{ fontSize: 13, color: '#94a3b8', marginTop: 4 }}>
                     {g.count} socket{g.count === 1 ? '' : 's'}
@@ -522,6 +543,34 @@ export default function App() {
             </div>
           ))}
           {alerts.length === 0 && <p style={{ color: '#94a3b8' }}>No rule alerts yet.</p>}
+        </div>
+      )}
+
+      {nav === 'checks' && (
+        <div style={{ ...card, marginBottom: 12 }}>
+          <h2 style={{ marginTop: 0 }}>Checks — modular threat detection</h2>
+          <p style={{ color: '#94a3b8' }}>
+            Each check is one independent rule: it returns a finding (rule, severity, score, evidence, explanation) or nothing.
+            A new check is one class + one registration line — no ingest logic to edit. A high score means <strong>investigate</strong>, not confirmed malware.
+            Scores are starting defaults and are tunable per check in code. Disabled checks stay listed here.
+          </p>
+          {(['Process', 'Destination', 'PortProtocol', 'Behavior', 'Listening', 'Ghost'] as const).map(cat => (
+            <div key={cat} style={{ marginBottom: 16 }}>
+              <h3>{cat === 'PortProtocol' ? 'Port / Protocol' : cat}</h3>
+              {checks.filter(c => c.category === cat).map(c => (
+                <div key={c.id} style={{ border: '1px solid #1e3a5f', borderRadius: 8, padding: 10, marginBottom: 8, opacity: c.enabled ? 1 : 0.6 }}>
+                  <strong>{c.title}</strong> <span style={{ color: '#94a3b8', fontSize: 12 }}>{c.id} · {c.engine} · {c.severity} · +{c.score}</span>
+                  <div style={{ fontSize: 13, marginTop: 4 }}>{c.description}</div>
+                  {c.unavailableReason && <div style={{ fontSize: 12, color: '#fbbf24', marginTop: 4 }}>⚠ {c.unavailableReason}</div>}
+                  <button style={{ marginTop: 6 }} onClick={async () => {
+                    await fetch(`/api/checks/${c.id}/toggle`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: !c.enabled }) })
+                    load()
+                  }}>{c.enabled ? 'Disable check' : 'Enable check'}</button>
+                </div>
+              ))}
+              {checks.filter(c => c.category === cat).length === 0 && <p style={{ color: '#94a3b8', fontSize: 13 }}>No checks in this category yet (server may be on an older build).</p>}
+            </div>
+          ))}
         </div>
       )}
 
@@ -634,6 +683,24 @@ export default function App() {
               <strong>What this is:</strong> {selected.detail}
             </div>
           )}
+          {(selected.score ?? 0) > 0 && (
+            <div style={{ border: '1px solid #2563eb', borderRadius: 8, padding: 10, marginBottom: 12, background: '#0a1930' }}>
+              <strong>Risk score: {selected.score} / 100 ({selected.tier})</strong>
+              <span style={{ color: '#94a3b8', fontSize: 12 }}> — sum of findings below, capped at 100. High means investigate, not confirmed malware.</span>
+            </div>
+          )}
+          {(selected.findings ?? []).length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <h3 style={{ margin: '0 0 6px' }}>Findings</h3>
+              {(selected.findings ?? []).map(f => (
+                <div key={f.ruleId} style={{ border: '1px solid #1e3a5f', borderRadius: 8, padding: 10, marginBottom: 8 }}>
+                  <strong>{f.title}</strong> <span style={{ color: f.severity === 'High' ? '#f87171' : f.severity === 'Medium' ? '#fbbf24' : '#94a3b8', fontSize: 12 }}>{f.severity} · +{f.score} · {f.ruleId}</span>
+                  <div style={{ fontSize: 13, marginTop: 4 }}>{f.evidence}</div>
+                  <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 4 }}>{f.explanation}</div>
+                </div>
+              ))}
+            </div>
+          )}
           {selected.flags.length > 0 && (
             <div style={{ border: '1px solid #f59e0b', borderRadius: 8, padding: 10, marginBottom: 12 }}>
               <strong>Why it matters:</strong>
@@ -646,6 +713,7 @@ export default function App() {
             <summary style={{ cursor: 'pointer', fontWeight: 700 }}>Raw detail — exactly what made this / is being hit</summary>
             <dl style={{ fontSize: 13 }}>
               <dt>Executable</dt><dd style={{ overflowWrap: 'anywhere' }}>{selected.exe || '—'} <button onClick={() => navigator.clipboard.writeText(selected.exe)}>Copy</button></dd>
+              <dt>Signature</dt><dd>{selected.signature || 'unknown'} (Windows agent only; Linux is always unknown)</dd>
               <dt>Command line</dt><dd style={{ overflowWrap: 'anywhere' }}>{selected.cmdline || '—'}</dd>
               <dt>Parent</dt><dd>{selected.parent} (pid {selected.ppid ?? ''}) — {selected.parentExe || '—'}</dd>
               <dt>User / unit / container</dt><dd>{selected.user || '—'} / {selected.unit || '—'} / {selected.container || selected.containerId || '—'}</dd>

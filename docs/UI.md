@@ -159,6 +159,22 @@ sketchy happening, and if so, what exactly is it?"
   open by default) with the full executable, command line, parent,
   unit/container, and timestamps. Attention rows carry a red
   (suspicious) or amber left border; ghosts stay muted.
+- **Modular checks (docs/CHECKS.md):** a rule-based threat
+  detection system with no AI and no cloud feed. Each check is an
+  `ICheck` class (rule ID, category, engine, severity, score,
+  evidence, explanation) registered in `CheckEngine.All`; adding
+  a check is one class + one registration line. Scores sum to a
+  0–100 tier (High ≥70, Medium ≥40, Low >0). Categories cover
+  process, destination, port/protocol, behavior (beaconing,
+  scanning, burst, repeated attempts, off-hours, duration),
+  listening, and ghost. Baselines are persisted (first-ever, seeded
+  from history on upgrade) and behavior history is in-memory
+  rolling windows. The UI shows Score/Tier, sorts Attention by
+  score, lists findings in the drawer, and has a Checks view with
+  enable/disable per check. Checks that need external data
+  (threat lists, WHOIS, GeoIP, byte counts) are documented as
+  unavailable rather than faked; the threat-list check fires only
+  against a user-supplied `NETGLASS_THREAT_LIST` file.
 - **Delete agent (Agents panel, `DELETE /api/agents/{id}`):** two-click
   confirm in the UI. Revokes the agent's token, drops its live/ghost
   rows, and deletes its SQLite agent row, pending kill requests, and
