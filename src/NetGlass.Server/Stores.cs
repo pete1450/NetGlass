@@ -238,29 +238,34 @@ public sealed class RecordingStore
             if (_baselineKeys is null)
             {
                 _baselineKeys = new HashSet<string>();
-                using var conn = Open();
-                using (var cmd = conn.CreateCommand())
+                // Distinct names + classic using blocks: the previous
+                // version reused conn/cmd across nested using-var scopes
+                // in this method, which the CI compiler rejects (CS0136).
+                using (var seedConn = Open())
                 {
-                    cmd.CommandText = "SELECT key FROM baselines";
-                    using var r = cmd.ExecuteReader();
-                    while (r.Read()) _baselineKeys.Add(r.GetString(0));
-                }
-                // Seed from seen_keys: key = agent|proto|direction|exe|local|remote
-                using (var cmd = conn.CreateCommand())
-                {
-                    cmd.CommandText = "SELECT key FROM seen_keys";
-                    using var r = cmd.ExecuteReader();
-                    while (r.Read())
+                    using (var baseCmd = seedConn.CreateCommand())
                     {
-                        var parts = r.GetString(0).Split('|');
-                        if (parts.Length != 6) continue;
-                        var (agent, direction, exe, local, remote) = (parts[0], parts[2], parts[3], parts[4], parts[5]);
-                        var rip = remote.Contains(':') ? remote[..remote.LastIndexOf(':')].Trim('[', ']') : remote;
-                        _baselineKeys.Add($"exe:{agent}|{exe}");
-                        _baselineKeys.Add($"dest:{agent}|{rip}");
-                        _baselineKeys.Add($"dest-global:{rip}");
-                        _baselineKeys.Add($"proc-dest:{agent}|{exe}|{rip}");
-                        if (direction == "listen") { _baselineKeys.Add($"listen-new:{agent}|{exe}|{local}"); _baselineKeys.Add($"listen-high:{agent}|{exe}|{local}"); }
+                        baseCmd.CommandText = "SELECT key FROM baselines";
+                        using var baseReader = baseCmd.ExecuteReader();
+                        while (baseReader.Read()) _baselineKeys.Add(baseReader.GetString(0));
+                    }
+                    // Seed from seen_keys: key = agent|proto|direction|exe|local|remote
+                    using (var seenCmd = seedConn.CreateCommand())
+                    {
+                        seenCmd.CommandText = "SELECT key FROM seen_keys";
+                        using var seenReader = seenCmd.ExecuteReader();
+                        while (seenReader.Read())
+                        {
+                            var parts = seenReader.GetString(0).Split('|');
+                            if (parts.Length != 6) continue;
+                            var (agent, direction, exe, local, remote) = (parts[0], parts[2], parts[3], parts[4], parts[5]);
+                            var rip = remote.Contains(':') ? remote[..remote.LastIndexOf(':')].Trim('[', ']') : remote;
+                            _baselineKeys.Add($"exe:{agent}|{exe}");
+                            _baselineKeys.Add($"dest:{agent}|{rip}");
+                            _baselineKeys.Add($"dest-global:{rip}");
+                            _baselineKeys.Add($"proc-dest:{agent}|{exe}|{rip}");
+                            if (direction == "listen") { _baselineKeys.Add($"listen-new:{agent}|{exe}|{local}"); _baselineKeys.Add($"listen-high:{agent}|{exe}|{local}"); }
+                        }
                     }
                 }
             }
