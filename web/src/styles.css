@@ -10,7 +10,7 @@ img,svg{max-width:100%}
    On narrow screens it scrolls inside its own wrapper, so the
    sidebar, stats and filters stay put and the user swipes the table. */
 .ng-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
-.ng-table-wrap table{min-width:900px}
+.ng-table-wrap table{min-width:1000px}
 
 /* ---- Mobile: sidebar becomes a top bar, everything stacks -------- */
 @media (max-width: 900px){

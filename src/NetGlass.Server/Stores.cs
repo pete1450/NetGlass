@@ -50,13 +50,14 @@ public sealed class ConnectionStore
                 c.Local, c.Remote, "", c.Pid, c.Process, c.Exe, c.Cmdline, c.User,
                 c.Ppid, c.Parent, c.ParentExe, c.Unit, c.Container, c.ContainerId,
                 c.Started, now, now, false, flags.Contains("NEW"), suspicious,
-                flags.ToArray());
+                flags.ToArray(), c.Detail ?? "");
             if (_entries.TryGetValue(key, out var existing))
             {
                 dto = existing.Conn with
                 {
                     LastSeen = now, IsGhost = false, State = c.State,
                     Pid = c.Pid, Process = c.Process, Cmdline = c.Cmdline,
+                    Detail = string.IsNullOrEmpty(c.Detail) ? existing.Conn.Detail : c.Detail,
                 };
                 existing.Conn = dto;
                 existing.Live = true;

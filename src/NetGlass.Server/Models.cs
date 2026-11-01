@@ -14,7 +14,8 @@ public sealed record ConnectionDto(
     int? Ppid, string Parent, string ParentExe,
     string Unit, string Container, string ContainerId,
     DateTime? Started, DateTime FirstSeen, DateTime LastSeen,
-    bool IsGhost, bool IsNew, bool Suspicious, string[] Flags);
+    bool IsGhost, bool IsNew, bool Suspicious, string[] Flags,
+    string Detail = "");
 
 public sealed record SnapshotConnection(
     string Direction, string Proto, string State,
@@ -22,7 +23,7 @@ public sealed record SnapshotConnection(
     int? Pid, string Process, string Exe, string Cmdline, string User,
     int? Ppid, string Parent, string ParentExe,
     string Unit, string Container, string ContainerId,
-    DateTime? Started);
+    DateTime? Started, string Detail = "");
 
 public sealed record SnapshotRequest(
     string Hostname, string Os, string Version,

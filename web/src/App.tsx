@@ -8,6 +8,7 @@ type Conn = {
   unit: string; container: string; containerId: string
   started?: string | null; firstSeen: string; lastSeen: string
   isGhost: boolean; isNew: boolean; suspicious: boolean; flags: string[]
+  detail?: string
 }
 type Agent = { id: string; name: string; hostname: string; os: string; version: string; lastSeen: string; socketCount: number }
 type Recording = { id: string; name: string; startedAt: string; endedAt?: string | null; eventCount: number }
@@ -26,11 +27,11 @@ function parseIp(addr: string): string | null {
   return null // unbracketed IPv6 with a port is ambiguous; bracketed form is what the agent sends
 }
 
-type SortKey = 'agentName' | 'direction' | 'process' | 'exe' | 'local' | 'remote' | 'state' | 'firstSeen' | 'lastSeen'
+type SortKey = 'agentName' | 'direction' | 'process' | 'detail' | 'exe' | 'local' | 'remote' | 'state' | 'firstSeen' | 'lastSeen'
 
 const COLUMNS: { key: SortKey; label: string }[] = [
   { key: 'agentName', label: 'Agent' }, { key: 'direction', label: 'Direction' },
-  { key: 'process', label: 'Process' }, { key: 'exe', label: 'Executable' },
+  { key: 'process', label: 'Process' }, { key: 'detail', label: 'Detail' }, { key: 'exe', label: 'Executable' },
   { key: 'local', label: 'Local' }, { key: 'remote', label: 'Remote' },
   { key: 'state', label: 'State' }, { key: 'firstSeen', label: 'First seen' },
   { key: 'lastSeen', label: 'Last seen' },
@@ -422,6 +423,7 @@ export default function App() {
               <td style={{ padding: 6 }}>{c.agentName}</td>
               <td style={{ padding: 6 }}>{c.direction}{c.isGhost ? ' (closed)' : ''}</td>
               <td style={{ padding: 6 }}><strong>{c.process}</strong> <span style={{ color: '#94a3b8' }}>pid {c.pid ?? ''}</span></td>
+              <td style={{ padding: 6, maxWidth: 280, color: c.detail ? '#e2e8f0' : '#64748b' }}>{c.detail || '—'}</td>
               <td style={{ padding: 6, maxWidth: 300, overflowWrap: 'anywhere' }}>{c.exe}</td>
               <td style={{ padding: 6 }}>{c.local}</td>
               <td style={{ padding: 6 }}>{c.remote}{c.remoteHost ? <><br /><span style={{ color: '#94a3b8' }}>{c.remoteHost}</span></> : null}</td>
@@ -431,7 +433,7 @@ export default function App() {
               <td style={{ padding: 6 }}>{c.flags.join(', ')}</td>
             </tr>
           ))}
-          {filtered.length === 0 && <tr><td colSpan={10} style={{ padding: 12, color: '#94a3b8' }}>No connections match. Connect an agent, or clear the filters.</td></tr>}
+          {filtered.length === 0 && <tr><td colSpan={11} style={{ padding: 12, color: '#94a3b8' }}>No connections match. Connect an agent, or clear the filters.</td></tr>}
         </tbody>
       </table>
       </div>
@@ -501,6 +503,11 @@ export default function App() {
           <button onClick={() => setSelected(null)} style={{ float: 'right' }}>Close (Esc)</button>
           <h2 style={{ marginTop: 0 }}>{selected.process} <span style={{ fontSize: 14, color: '#94a3b8' }}>pid {selected.pid ?? ''}</span></h2>
           <p><strong>{selected.direction}</strong> {selected.proto} {selected.state}<br />{selected.local} → {selected.remote || '—'}{selected.remoteHost ? ` (${selected.remoteHost})` : ''}</p>
+          {selected.detail && (
+            <div style={{ border: '1px solid #2563eb', borderRadius: 8, padding: 10, marginBottom: 12, background: '#0a1930' }}>
+              <strong>What this is:</strong> {selected.detail}
+            </div>
+          )}
           <h3>Exactly what made this (outgoing) / is being hit (incoming)</h3>
           <dl style={{ fontSize: 13 }}>
             <dt>Executable</dt><dd style={{ overflowWrap: 'anywhere' }}>{selected.exe || '—'} <button onClick={() => navigator.clipboard.writeText(selected.exe)}>Copy</button></dd>

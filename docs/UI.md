@@ -126,6 +126,18 @@ sketchy happening, and if so, what exactly is it?"
   zoom-on-focus, touch targets are at least 40–44px, and the detail
   drawer becomes a bottom sheet (full-width, 85vh max) instead of a
   420px panel hanging off-screen.
+- **Detail column:** the Linux agent adds a `Detail` field, carried
+  through the server to a sortable Detail column and a "What this
+  is" box in the drawer. docker-proxy is parsed from its command
+  line (`-host-ip/-host-port/-container-ip/-container-port`) and
+  matched via the Docker API to a container name, e.g. "Proxies
+  0.0.0.0:8077 → netglass-server:8080 (tcp)"; containerd-shim is
+  matched via its `-id` to a container name; dockerd is matched by
+  published port or container IP; ntpd/chronyd/systemd-timesyncd
+  are labelled "Time synchronisation (NTP)"; other container
+  processes show "Container &lt;name&gt;", and host processes talking
+  to a container show "Talks to container &lt;name&gt;". Old agents
+  send no Detail and show "—" in that column.
 - **Delete agent (Agents panel, `DELETE /api/agents/{id}`):** two-click
   confirm in the UI. Revokes the agent's token, drops its live/ghost
   rows, and deletes its SQLite agent row, pending kill requests, and

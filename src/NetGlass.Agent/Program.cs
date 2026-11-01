@@ -230,13 +230,41 @@ static class KillExecutor
 static class ContainerNames
 {
     private static Dictionary<string, string> _map = new();
+    private static List<(string Id, string Name, List<string> Ips, List<(int Public, int Private, string Type)> Ports)> _containers = new();
     private static DateTime _updated = DateTime.MinValue;
+
+    public static void Ensure()
+    {
+        if (DateTime.UtcNow - _updated > TimeSpan.FromSeconds(30)) Refresh();
+    }
 
     public static string Lookup(string containerId)
     {
-        if (DateTime.UtcNow - _updated > TimeSpan.FromSeconds(30)) Refresh();
+        Ensure();
+        if (string.IsNullOrEmpty(containerId)) return "";
         return _map.TryGetValue(containerId, out var name) ? name
             : _map.TryGetValue(containerId[..Math.Min(12, containerId.Length)], out name) ? name : "";
+    }
+
+    // Container IP (+ optional private port) -> container name. Used for
+    // docker-proxy's -container-ip/-container-port and for any socket
+    // whose local/remote IP is a container IP.
+    public static string ByIpPort(string ip, int privatePort = 0)
+    {
+        Ensure();
+        foreach (var c in _containers)
+            if (c.Ips.Contains(ip) && (privatePort == 0 || c.Ports.Any(p => p.Private == privatePort)))
+                return c.Name;
+        return "";
+    }
+
+    public static string ByPublicPort(int publicPort, string proto = "")
+    {
+        Ensure();
+        foreach (var c in _containers)
+            if (c.Ports.Any(p => p.Public == publicPort && (string.IsNullOrEmpty(proto) || p.Type == proto)))
+                return c.Name;
+        return "";
     }
 
     private static void Refresh()
@@ -272,14 +300,33 @@ static class ContainerNames
             }
             var doc = JsonDocument.Parse(body);
             var map = new Dictionary<string, string>();
+            var containers = new List<(string, string, List<string>, List<(int, int, string)>)>();
             foreach (var item in doc.RootElement.EnumerateArray())
             {
                 var id = item.GetProperty("Id").GetString() ?? "";
                 var names = item.GetProperty("Names");
                 var name = names.GetArrayLength() > 0 ? names[0].GetString()?.TrimStart('/') ?? "" : "";
                 if (!string.IsNullOrEmpty(id)) { map[id] = name; map[id[..12]] = name; }
+                var ips = new List<string>();
+                if (item.TryGetProperty("NetworkSettings", out var ns) &&
+                    ns.TryGetProperty("Networks", out var nets))
+                    foreach (var net in nets.EnumerateObject())
+                        if (net.Value.TryGetProperty("IPAddress", out var ipEl) &&
+                            ipEl.GetString() is string ipStr && !string.IsNullOrEmpty(ipStr))
+                            ips.Add(ipStr);
+                var ports = new List<(int, int, string)>();
+                if (item.TryGetProperty("Ports", out var portsEl))
+                    foreach (var p in portsEl.EnumerateArray())
+                    {
+                        var pub = p.TryGetProperty("PublicPort", out var pp) ? pp.GetInt32() : 0;
+                        var priv = p.TryGetProperty("PrivatePort", out var pr) ? pr.GetInt32() : 0;
+                        var typ = p.TryGetProperty("Type", out var ty) ? ty.GetString() ?? "" : "";
+                        if (priv != 0) ports.Add((pub, priv, typ));
+                    }
+                containers.Add((id, name, ips, ports));
             }
             _map = map;
+            _containers = containers;
         }
         catch { /* container names are best-effort; ids still identify the container */ }
     }
@@ -289,7 +336,8 @@ sealed record CollectedConnection(
     string Direction, string Proto, string State, string Local, string Remote,
     int? Pid, string Process, string Exe, string Cmdline, string User,
     int? Ppid, string Parent, string ParentExe,
-    string Unit, string Container, string ContainerId, DateTime? Started);
+    string Unit, string Container, string ContainerId, DateTime? Started,
+    string Detail = "");
 
 static class Collector
 {
@@ -299,9 +347,87 @@ static class Collector
     public static List<CollectedConnection> Collect() =>
         RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? LinuxCollect() : WindowsCollect();
 
+    // Detail for generic host processes. docker-proxy, dockerd and
+    // containerd-shim look identical in a table, but their command
+    // lines + the Docker API tell you which container they are
+    // actually for. ntpd/chronyd are time sync, not a mystery service.
+    private static string DetailFor(ProcInfo? info, string proto, string local, string remote)
+    {
+        if (info is null) return "";
+        var name = info.Name;
+        var cmd = info.Cmdline ?? "";
+        string Flag(string f)
+        {
+            var parts = cmd.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            for (var i = 0; i + 1 < parts.Length; i++)
+                if (parts[i] == f) return parts[i + 1];
+            return "";
+        }
+        string IpOf(string addr)
+        {
+            try { return addr.Contains(':') ? addr[..addr.LastIndexOf(':')].Trim('[', ']') : ""; }
+            catch { return ""; }
+        }
+        if (name == "docker-proxy")
+        {
+            var hostIp = Flag("-host-ip");
+            var hostPort = Flag("-host-port");
+            var contIp = Flag("-container-ip");
+            var contPortStr = Flag("-container-port");
+            int.TryParse(contPortStr, out var contPort);
+            var contName = !string.IsNullOrEmpty(contIp) ? ContainerNames.ByIpPort(contIp, contPort) : "";
+            var target = !string.IsNullOrEmpty(contName) ? contName : contIp;
+            if (!string.IsNullOrEmpty(hostPort) || !string.IsNullOrEmpty(target))
+                return $"Proxies {hostIp}:{hostPort} → {target}:{contPortStr} ({proto})";
+            return "Docker published-port proxy (see command line in the drawer)";
+        }
+        if (name.Contains("containerd-shim"))
+        {
+            var shimName = ContainerNames.Lookup(Flag("-id"));
+            return !string.IsNullOrEmpty(shimName) ? $"Container runtime shim for {shimName}" : "Container runtime shim";
+        }
+        if (name == "dockerd")
+        {
+            var localPort = PortOf(local);
+            var byPub = localPort > 0 ? ContainerNames.ByPublicPort(localPort, proto) : "";
+            if (!string.IsNullOrEmpty(byPub)) return $"Docker daemon — published port {localPort} for {byPub}";
+            var rip = IpOf(remote);
+            if (!string.IsNullOrEmpty(rip))
+            {
+                var n = ContainerNames.ByIpPort(rip);
+                if (!string.IsNullOrEmpty(n)) return $"Docker daemon — talks to container {n}";
+            }
+            var lip = IpOf(local);
+            if (!string.IsNullOrEmpty(lip))
+            {
+                var n = ContainerNames.ByIpPort(lip);
+                if (!string.IsNullOrEmpty(n)) return $"Docker daemon — container {n}";
+            }
+            return "";
+        }
+        if (name is "ntpd" or "chronyd" or "systemd-timesyncd")
+            return "Time synchronisation (NTP)";
+        var ownContainer = !string.IsNullOrEmpty(info.ContainerId) ? ContainerNames.Lookup(info.ContainerId) : "";
+        if (!string.IsNullOrEmpty(ownContainer)) return $"Container {ownContainer}";
+        var rIp = IpOf(remote);
+        if (!string.IsNullOrEmpty(rIp))
+        {
+            var n = ContainerNames.ByIpPort(rIp);
+            if (!string.IsNullOrEmpty(n)) return $"Talks to container {n}";
+        }
+        var lIp = IpOf(local);
+        if (!string.IsNullOrEmpty(lIp))
+        {
+            var n = ContainerNames.ByIpPort(lIp);
+            if (!string.IsNullOrEmpty(n)) return $"Container {n}";
+        }
+        return "";
+    }
+
     // ---- Linux: /proc ----
     private static List<CollectedConnection> LinuxCollect()
     {
+        ContainerNames.Ensure();
         var procRoot = Environment.GetEnvironmentVariable("PROC_ROOT") ?? "/proc";
         // Network namespaces: each Docker container (unless it uses host
         // networking) has its own net namespace, so /proc/net/* alone only
@@ -392,11 +518,19 @@ static class Collector
             var parent = info is not null && info.Ppid > 0 ? Proc(info.Ppid) : null;
             var containerName = info is not null && !string.IsNullOrEmpty(info.ContainerId)
                 ? ContainerNames.Lookup(info.ContainerId) : "";
+            var detail = DetailFor(info, r.Proto, r.Local, r.Remote);
+            // docker-proxy's container is the one it proxies for, not
+            // the host process itself — surface that in the drawer too.
+            if (info?.Name == "docker-proxy" && !string.IsNullOrEmpty(detail) && detail.Contains("→"))
+            {
+                var target = detail.Split('→')[1].Trim().Split(':')[0].Trim();
+                if (!string.IsNullOrEmpty(target) && !System.Net.IPAddress.TryParse(target, out _) && target != containerName) containerName = target;
+            }
             result.Add(new CollectedConnection(direction, r.Proto, r.State, r.Local, r.Remote,
                 pid == 0 ? null : pid, info?.Name ?? "(unknown)", info?.Exe ?? "",
                 info?.Cmdline ?? "", info?.User ?? "", info?.Ppid,
                 parent?.Name ?? "", parent?.Exe ?? "", info?.Unit ?? "",
-                containerName, info?.ContainerId ?? "", info?.Started));
+                containerName, info?.ContainerId ?? "", info?.Started, detail));
         }
         return result;
     }
