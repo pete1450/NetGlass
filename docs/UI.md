@@ -138,6 +138,27 @@ sketchy happening, and if so, what exactly is it?"
   processes show "Container &lt;name&gt;", and host processes talking
   to a container show "Talks to container &lt;name&gt;". Old agents
   send no Detail and show "—" in that column.
+- **Triage + tidy (Attention default, grouped, detail preserved):**
+  the Agents page defaults to an Attention view (suspicious, new,
+  public, or uncommon-port rows) with a plain-English summary
+  ("2 new listeners · 1 suspicious …") instead of 7 clickable stat
+  cards; stats are now read-only. Rows are grouped by agent +
+  process + Detail into expandable service groups (count, listeners,
+  suspicious/new/closed counts, remote count); expanding a group
+  shows its sockets, and the flat "All sockets" table is a toggle
+  away. Default columns are Agent, Direction, Process, Detail,
+  Remote (+ Flags); a Columns picker (saved in localStorage) can
+  restore any/all columns. Add agent and agent management moved to
+  a Manage agents view; recording controls live in the Recordings
+  view (an active recording still shows a small banner on Agents).
+  The sidebar has an Alerts view fed by the existing
+  `GET /api/alerts` endpoint, with a count and a "Find connection"
+  button that jumps to that connection in the flat list. The drawer
+  is now What this is, Why it matters (flags explained in plain
+  English), How to kill it, IP info, then Raw detail (collapsible,
+  open by default) with the full executable, command line, parent,
+  unit/container, and timestamps. Attention rows carry a red
+  (suspicious) or amber left border; ghosts stay muted.
 - **Delete agent (Agents panel, `DELETE /api/agents/{id}`):** two-click
   confirm in the UI. Revokes the agent's token, drops its live/ghost
   rows, and deletes its SQLite agent row, pending kill requests, and

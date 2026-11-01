@@ -12,6 +12,7 @@ type Conn = {
 }
 type Agent = { id: string; name: string; hostname: string; os: string; version: string; lastSeen: string; socketCount: number }
 type Recording = { id: string; name: string; startedAt: string; endedAt?: string | null; eventCount: number }
+type AlertItem = { at: string; rule: string; message: string; agent: string; detail: string }
 type IpInfo = {
   ip: string; isp: string; org: string; as: string; country: string; countryCode: string
   region: string; city: string; timezone: string; reverse: string
@@ -53,21 +54,31 @@ export default function App() {
   const [counts, setCounts] = useState<Record<string, number>>({})
   const [agents, setAgents] = useState<Agent[]>([])
   const [recordings, setRecordings] = useState<Recording[]>([])
-  const [view, setView] = useState<'all' | 'outgoing' | 'incoming' | 'suspicious'>('all')
-  const [nav, setNav] = useState<'agents' | 'recordings' | 'settings' | 'about'>('agents')
+  const [alerts, setAlerts] = useState<AlertItem[]>([])
+  // Triage-first: Attention is the default view. It shows only rows
+  // with a reason to care (suspicious, new, public, uncommon port).
+  // All / flat is always one tap away, and the drawer still carries
+  // the full detail for every row — nothing is hidden, only grouped.
+  const [view, setView] = useState<'attention' | 'all' | 'outgoing' | 'incoming' | 'listeners' | 'suspicious'>('attention')
+  const [nav, setNav] = useState<'agents' | 'alerts' | 'manage' | 'recordings' | 'settings' | 'about'>('agents')
+  const [grouped, setGrouped] = useState(true)
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
+  const [showColumns, setShowColumns] = useState(false)
+  const [visibleCols, setVisibleCols] = useState<SortKey[]>(() => {
+    try {
+      const saved = localStorage.getItem('ng-columns')
+      if (saved) { const parsed = JSON.parse(saved) as string[]; const valid = parsed.filter(c => COLUMNS.some(col => col.key === c)) as SortKey[]; if (valid.length) return valid }
+    } catch { /* fall through to defaults */ }
+    return ['agentName', 'direction', 'process', 'detail', 'remote']
+  })
   const [appriseUrls, setAppriseUrls] = useState('')
   const [appriseApiUrl, setAppriseApiUrl] = useState('')
   const [appriseStatus, setAppriseStatus] = useState('')
   const [q, setQ] = useState('')
   const [agentFilter, setAgentFilter] = useState('')
-  const [dirFilter, setDirFilter] = useState('')
-  const [onlyNew, setOnlyNew] = useState(false)
-  const [onlySusp, setOnlySusp] = useState(false)
-  const [onlyListen, setOnlyListen] = useState(false)
   const [sortKey, setSortKey] = useState<SortKey>('lastSeen')
   const [sortDir, setSortDir] = useState<1 | -1>(-1)
   const [selected, setSelected] = useState<Conn | null>(null)
-  const [showAddAgent, setShowAddAgent] = useState(false)
   const [newAgentName, setNewAgentName] = useState('')
   const [compose, setCompose] = useState('')
   const [linger, setLinger] = useState(30)
@@ -84,16 +95,21 @@ export default function App() {
 
   const load = useCallback(async () => {
     try {
-      const [c, a, r] = await Promise.all([
+      const [c, a, r, al] = await Promise.all([
         fetch('/api/connections').then(x => x.json()),
         fetch('/api/agents').then(x => x.json()),
         fetch('/api/recordings').then(x => x.json()),
+        fetch('/api/alerts').then(x => x.json()).catch(() => []),
       ])
       setConns(c.connections ?? []); setCounts(c.counts ?? {})
-      setAgents(a ?? []); setRecordings(r ?? [])
+      setAgents(a ?? []); setRecordings(r ?? []); setAlerts(Array.isArray(al) ? al : [])
       setLastUpdated(new Date())
     } catch { /* server down: keep last state, UI shows stale counts */ }
   }, [])
+
+  useEffect(() => {
+    try { localStorage.setItem('ng-columns', JSON.stringify(visibleCols)) } catch { /* private mode */ }
+  }, [visibleCols])
 
   // Pause freezes the displayed snapshot: no automatic polling while
   // paused, so rows stop shifting under you. The server, agents,
@@ -112,19 +128,21 @@ export default function App() {
     window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  const isAttention = (c: Conn) =>
+    c.suspicious || c.isNew || c.flags.includes('PUBLIC') || c.flags.includes('UNCOMMON_PORT') ||
+    c.flags.includes('TMP_EXE') || c.flags.includes('DELETED_EXE') || c.flags.includes('NO_EXE')
+
   const filtered = useMemo(() => {
     let rows = conns
+    if (view === 'attention') rows = rows.filter(isAttention)
     if (view === 'outgoing') rows = rows.filter(c => c.direction === 'outbound')
     if (view === 'incoming') rows = rows.filter(c => c.direction === 'inbound' || c.direction === 'listen')
+    if (view === 'listeners') rows = rows.filter(c => c.direction === 'listen')
     if (view === 'suspicious') rows = rows.filter(c => c.suspicious)
     if (agentFilter) rows = rows.filter(c => c.agentId === agentFilter)
-    if (dirFilter) rows = rows.filter(c => c.direction === dirFilter)
-    if (onlyNew) rows = rows.filter(c => c.isNew)
-    if (onlySusp) rows = rows.filter(c => c.suspicious)
-    if (onlyListen) rows = rows.filter(c => c.direction === 'listen')
     if (q) {
       const needle = q.toLowerCase()
-      rows = rows.filter(c => [c.process, c.exe, c.cmdline, c.remote, c.remoteHost, c.local, c.unit, c.container, c.agentName, String(c.pid ?? '')].join(' ').toLowerCase().includes(needle))
+      rows = rows.filter(c => [c.process, c.exe, c.cmdline, c.remote, c.remoteHost, c.local, c.unit, c.container, c.agentName, String(c.pid ?? ''), c.detail ?? ''].join(' ').toLowerCase().includes(needle))
     }
     const sorted = [...rows].sort((a, b) => {
       const av = String((a as unknown as Record<string, unknown>)[sortKey] ?? '')
@@ -132,19 +150,47 @@ export default function App() {
       return av.localeCompare(bv) * sortDir
     })
     return sorted
-  }, [conns, view, agentFilter, dirFilter, onlyNew, onlySusp, onlyListen, q, sortKey, sortDir])
+  }, [conns, view, agentFilter, q, sortKey, sortDir])
 
-  const groupedIncoming = useMemo(() => {
-    const map = new Map<string, { service: string; process: string; unit: string; container: string; remotes: Set<string>; count: number }>()
-    for (const c of filtered.filter(x => x.direction === 'inbound' || x.direction === 'listen')) {
-      const key = `${c.agentName}|${c.process}|${c.local}`
-      const entry = map.get(key) ?? { service: c.local, process: c.process, unit: c.unit, container: c.container, remotes: new Set(), count: 0 }
-      if (c.remote) entry.remotes.add(c.remote)
-      entry.count++
-      map.set(key, entry)
+  // Grouped view: collapse repeats of the same service into one row.
+  // Grouping is display-only — expanding a group shows its individual
+  // sockets, and clicking any socket opens the full drawer.
+  const groups = useMemo(() => {
+    const map = new Map<string, { key: string; agentName: string; process: string; detail: string; container: string; exe: string; count: number; suspicious: number; isNew: number; ghosts: number; listeners: number; remotes: Set<string>; rows: Conn[] }>()
+    for (const c of filtered) {
+      const key = `${c.agentId}|${c.process}|${c.detail || c.container || c.exe}`
+      const g = map.get(key) ?? { key, agentName: c.agentName, process: c.process, detail: c.detail ?? '', container: c.container, exe: c.exe, count: 0, suspicious: 0, isNew: 0, ghosts: 0, listeners: 0, remotes: new Set(), rows: [] }
+      g.count++; if (c.suspicious) g.suspicious++; if (c.isNew) g.isNew++; if (c.isGhost) g.ghosts++; if (c.direction === 'listen') g.listeners++
+      if (c.remote) g.remotes.add(c.remote)
+      g.rows.push(c)
+      map.set(key, g)
     }
-    return [...map.values()].sort((a, b) => b.remotes.size - a.remotes.size)
+    return [...map.values()].sort((a, b) => (b.suspicious - a.suspicious) || (b.isNew - a.isNew) || (b.count - a.count))
   }, [filtered])
+
+  const summary = useMemo(() => {
+    const suspicious = conns.filter(c => c.suspicious).length
+    const newListeners = conns.filter(c => c.isNew && c.direction === 'listen').length
+    const publicListeners = conns.filter(c => c.flags.includes('PUBLIC')).length
+    const newDestinations = conns.filter(c => c.isNew && c.direction === 'outbound').length
+    const parts: string[] = []
+    if (suspicious) parts.push(`${suspicious} suspicious`)
+    if (newListeners) parts.push(`${newListeners} new listener${newListeners === 1 ? '' : 's'}`)
+    if (publicListeners) parts.push(`${publicListeners} public listener${publicListeners === 1 ? '' : 's'}`)
+    if (newDestinations) parts.push(`${newDestinations} new outbound destination${newDestinations === 1 ? '' : 's'}`)
+    if (alerts.length) parts.push(`${alerts.length} rule alert${alerts.length === 1 ? '' : 's'}`)
+    return { parts, total: conns.length, agents: agents.length, ghosts: conns.filter(c => c.isGhost).length }
+  }, [conns, agents, alerts])
+
+  const flagWhy: Record<string, string> = {
+    NEW: 'First seen in the last 24 hours — new to this host.',
+    LISTENER: 'Listening for incoming connections.',
+    TMP_EXE: 'Executable is in a temporary directory — a common malware tactic.',
+    DELETED_EXE: 'Executable was deleted from disk while still running — suspicious.',
+    NO_EXE: 'No executable could be found for this process.',
+    PUBLIC: 'Listening on a public interface — reachable from other machines.',
+    UNCOMMON_PORT: 'Port is not a well-known service port.',
+  }
 
   async function createAgent() {
     const res = await fetch('/api/agents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: newAgentName || 'new-agent' }) })
@@ -234,6 +280,30 @@ export default function App() {
     else { setSortKey(key); setSortDir(1) }
   }
 
+  // One cell renderer for both grouped and flat tables, so the
+  // visible-columns picker applies everywhere. Full detail for any
+  // row is always in the drawer, regardless of visible columns.
+  const cellFor = (c: Conn, key: SortKey) => {
+    switch (key) {
+      case 'agentName': return c.agentName
+      case 'direction': return <>{c.direction}{c.isGhost ? ' (closed)' : ''}</>
+      case 'process': return <><strong>{c.process}</strong> <span style={{ color: '#94a3b8' }}>pid {c.pid ?? ''}</span></>
+      case 'detail': return <span style={{ color: c.detail ? '#e2e8f0' : '#64748b' }}>{c.detail || '—'}</span>
+      case 'exe': return <span style={{ overflowWrap: 'anywhere' }}>{c.exe}</span>
+      case 'local': return c.local
+      case 'remote': return <>{c.remote}{c.remoteHost ? <><br /><span style={{ color: '#94a3b8' }}>{c.remoteHost}</span></> : null}</>
+      case 'state': return c.state
+      case 'firstSeen': return c.firstSeen ? new Date(c.firstSeen).toLocaleString() : ''
+      case 'lastSeen': return c.lastSeen ? new Date(c.lastSeen).toLocaleString() : ''
+    }
+  }
+  const rowStyle = (c: Conn): React.CSSProperties => ({
+    background: c.suspicious ? '#450a0a' : c.isGhost ? '#1e293b' : undefined,
+    opacity: c.isGhost ? 0.6 : 1, cursor: 'pointer',
+    borderLeft: c.suspicious ? '4px solid #ef4444' : isAttention(c) ? '4px solid #f59e0b' : '4px solid transparent',
+  })
+  const openRow = (c: Conn) => { setSelected(c); setConfirmKill(false); setKillStatus('') }
+
   const activeRecording = recordings.find(r => !r.endedAt)
   const card: React.CSSProperties = { background: '#0d1b33', border: '1px solid #1e3a5f', borderRadius: 12, padding: 12 }
   const inputStyle: React.CSSProperties = { background: '#0a1526', border: '1px solid #1e3a5f', borderRadius: 8, color: '#e2e8f0', padding: '8px 10px' }
@@ -269,6 +339,8 @@ export default function App() {
         </div>
         <div className="ng-nav" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {navItem('agents', 'Agents', '▣')}
+        {navItem('alerts', `Alerts${alerts.length ? ` (${alerts.length})` : ''}`, '⚠')}
+        {navItem('manage', 'Manage agents', '⚙')}
         {navItem('recordings', 'Recordings', '▶')}
         {navItem('settings', 'Settings', '⚙')}
         {navItem('about', 'About', 'ⓘ')}
@@ -281,6 +353,18 @@ export default function App() {
       <main className="ng-main" style={{ flex: 1, minWidth: 0, padding: 20, maxWidth: 1500 }}>
       <h1 style={{ margin: '0 0 4px', fontSize: 34 }}>Net<span style={{ color: '#22d3ee' }}>Glass</span></h1>
       <p style={{ color: '#94a3b8', marginTop: 0 }}>Local-first process network visibility. No cloud. Click a row for the full story, including how to kill it.</p>
+      {nav === 'agents' && (
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 12 }}>
+          <button onClick={() => setNav('manage')} style={{ background: 'linear-gradient(90deg, #2563eb, #0ea5e9)', color: '#fff', border: 'none', borderRadius: 12, padding: '10px 16px', fontWeight: 700, cursor: 'pointer' }}>+ Add agent</button>
+          <button onClick={() => setPaused(p => !p)} style={{ ...card, fontWeight: 700, cursor: 'pointer' }}>
+            {paused ? '▶ Resume live updates' : '⏸ Pause live updates'}
+          </button>
+          <button onClick={() => setGrouped(g => !g)} style={{ ...card, cursor: 'pointer' }}>
+            {grouped ? '▤ Grouped by service' : '☰ All sockets (flat)'}
+          </button>
+          <button onClick={() => setShowColumns(v => !v)} style={{ ...card, cursor: 'pointer' }}>Columns ▾</button>
+        </div>
+      )}
 
       {nav === 'agents' && (<>
       <div className="ng-stats" style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
@@ -290,19 +374,11 @@ export default function App() {
           ['New (24h)', conns.filter(c => c.isNew).length, '◷'],
           ['Ghosts', conns.filter(c => c.isGhost).length, '👻'],
         ] as const).map(([label, value, icon]) => (
-          <button key={label} onClick={() => {
-            if (label === 'Suspicious') { setView('suspicious'); setOnlySusp(false) }
-            if (label === 'New (24h)') setOnlyNew(true)
-            if (label === 'Listeners') setOnlyListen(true)
-          }} style={{ ...card, textAlign: 'left', display: 'flex', gap: 10, alignItems: 'center', cursor: 'pointer', flex: '1 1 110px' }}>
+          <div key={label} style={{ ...card, textAlign: 'left', display: 'flex', gap: 10, alignItems: 'center', flex: '1 1 110px' }}>
             <span style={{ fontSize: 20 }}>{icon}</span>
             <span><div style={{ fontSize: 22, fontWeight: 700 }}>{value ?? 0}</div><div style={{ fontSize: 12, color: '#94a3b8' }}>{label}</div></span>
-          </button>
+          </div>
         ))}
-        <button onClick={() => setShowAddAgent(v => !v)} style={{ background: 'linear-gradient(90deg, #2563eb, #0ea5e9)', color: '#fff', border: 'none', borderRadius: 12, padding: '12px 18px', fontWeight: 700, cursor: 'pointer' }}>+ Add agent</button>
-        <button onClick={() => setPaused(p => !p)} style={{ ...card, fontWeight: 700, cursor: 'pointer' }}>
-          {paused ? '▶ Resume live updates' : '⏸ Pause live updates'}
-        </button>
       </div>
 
       {paused && (
@@ -312,8 +388,16 @@ export default function App() {
         </div>
       )}
 
+      <div style={{ ...card, marginBottom: 12, borderColor: summary.parts.length ? '#f59e0b' : '#1e3a5f' }}>
+        <strong>{summary.parts.length ? `⚠ ${summary.parts.join(' · ')}` : '✓ Nothing concerning right now.'}</strong>
+        <span style={{ color: '#94a3b8', fontSize: 13 }}> — {summary.total} connections across {summary.agents} agent{summary.agents === 1 ? '' : 's'}, {summary.ghosts} ghost{summary.ghosts === 1 ? '' : 's'}.</span>
+        {view !== 'attention' && <button onClick={() => setView('attention')} style={{ marginLeft: 8 }}>Show attention only</button>}
+        {grouped && <span style={{ color: '#94a3b8', fontSize: 13 }}> Grouped by service — expand a group, then click a socket for its full detail.</span>}
+        {!grouped && <span style={{ color: '#94a3b8', fontSize: 13 }}> Flat list — every socket, with all visible columns, click any row for its full detail.</span>}
+      </div>
+
       <div className="ng-filters" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12, alignItems: 'center' }}>
-        {([['all', 'All'], ['outgoing', 'Outgoing'], ['incoming', 'Incoming'], ['suspicious', 'Suspicious']] as const).map(([key, label]) => (
+        {([['attention', 'Attention'], ['all', 'All'], ['outgoing', 'Outgoing'], ['incoming', 'Incoming'], ['listeners', 'Listeners'], ['suspicious', 'Suspicious']] as const).map(([key, label]) => (
           <button key={key} onClick={() => setView(key)} disabled={view === key} style={{ background: view === key ? '#2563eb' : '#0d1b33', color: '#fff', border: '1px solid #1e3a5f', borderRadius: 10, padding: '8px 14px', cursor: 'pointer' }}>{label}</button>
         ))}
         <input id="search" value={q} onChange={e => setQ(e.target.value)} placeholder="Search…  ( / to focus )" style={{ ...inputStyle, flex: 1, minWidth: 240 }} />
@@ -321,122 +405,163 @@ export default function App() {
           <option value="">All agents</option>
           {agents.map(a => <option key={a.id} value={a.id}>{a.name} ({a.hostname || a.id.slice(0, 8)})</option>)}
         </select>
-        <select value={dirFilter} onChange={e => setDirFilter(e.target.value)} style={inputStyle}>
-          <option value="">All directions</option><option>outbound</option><option>inbound</option><option>listen</option><option>local</option>
-        </select>
-        <label><input type="checkbox" checked={onlyNew} onChange={e => setOnlyNew(e.target.checked)} /> Only new</label>
-        <label><input type="checkbox" checked={onlySusp} onChange={e => setOnlySusp(e.target.checked)} /> Only suspicious</label>
-        <button onClick={() => setOnlyListen(v => !v)} style={{ background: onlyListen ? '#2563eb' : '#0d1b33', color: '#fff', border: '1px solid #1e3a5f', borderRadius: 20, padding: '6px 12px', cursor: 'pointer' }}>
-          {onlyListen ? '● Only listeners' : '○ Only listeners'}
-        </button>
-        <label title="How long a closed connection stays visible, faded">Ghost linger
-          <input type="range" min={0} max={300} value={linger} onChange={e => saveLinger(Number(e.target.value))} /> {linger}s
-        </label>
+
       </div>
+      {showColumns && (
+        <div style={{ ...card, marginBottom: 12 }}>
+          <strong>Columns</strong> <span style={{ color: '#94a3b8', fontSize: 12 }}>— defaults are Agent, Direction, Process, Detail, Remote. Everything else is always in the drawer.</span>
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
+            {COLUMNS.map(col => (
+              <label key={col.key}><input type="checkbox" checked={visibleCols.includes(col.key)} onChange={e => setVisibleCols(v => e.target.checked ? [...v, col.key] : v.filter(c => c !== col.key))} /> {col.label}</label>
+            ))}
+          </div>
+          <div style={{ marginTop: 8 }}>
+            <button onClick={() => setVisibleCols(['agentName', 'direction', 'process', 'detail', 'remote'])}>Reset to defaults</button>{' '}
+            <button onClick={() => setVisibleCols(COLUMNS.map(c => c.key))}>Show all columns</button>
+          </div>
+        </div>
+      )}
       </>)}
 
       {nav === 'agents' && (<>
-      {showAddAgent && (
+      {activeRecording && (
+        <div style={{ ...card, marginBottom: 12 }}>
+          <span>● Recording “{activeRecording.name}” — {activeRecording.eventCount} events</span>{' '}
+          <button onClick={() => stopRecording(activeRecording.id)}>Stop</button>{' '}
+          <button onClick={() => setNav('recordings')}>Recordings →</button>
+        </div>
+      )}
+
+      {grouped ? (
+        <div>
+          {groups.map(g => {
+            const expanded = expandedGroups.has(g.key)
+            return (
+              <div key={g.key} style={{ ...card, marginBottom: 8, borderLeft: g.suspicious ? '4px solid #ef4444' : (g.isNew ? '4px solid #f59e0b' : undefined) }}>
+                <button onClick={() => setExpandedGroups(prev => { const next = new Set(prev); if (next.has(g.key)) next.delete(g.key); else next.add(g.key); return next })} style={{ background: 'transparent', border: 'none', color: '#e2e8f0', cursor: 'pointer', textAlign: 'left', width: '100%', padding: 0 }}>
+                  <span style={{ fontSize: 16 }}>{expanded ? '▾' : '▸'} <strong>{g.process}</strong></span>{' '}
+                  <span style={{ color: '#94a3b8' }}>{g.agentName}{g.detail ? ` — ${g.detail}` : g.container ? ` — ${g.container}` : ''}</span>
+                  <div style={{ fontSize: 13, color: '#94a3b8', marginTop: 4 }}>
+                    {g.count} socket{g.count === 1 ? '' : 's'}
+                    {g.listeners ? ` · ${g.listeners} listener${g.listeners === 1 ? '' : 's'}` : ''}
+                    {g.suspicious ? ` · ⚠ ${g.suspicious} suspicious` : ''}
+                    {g.isNew ? ` · ${g.isNew} new` : ''}
+                    {g.ghosts ? ` · ${g.ghosts} closed` : ''}
+                    {g.remotes.size ? ` · ${g.remotes.size} remote${g.remotes.size === 1 ? '' : 's'}` : ''}
+                  </div>
+                </button>
+                {expanded && (
+                  <div className="ng-table-wrap" style={{ marginTop: 8 }}>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                      <thead><tr>
+                        {COLUMNS.filter(col => visibleCols.includes(col.key)).map(col => (
+                          <th key={col.key} onClick={() => toggleSort(col.key)} style={{ textAlign: 'left', borderBottom: '1px solid #334155', padding: 6, cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                            {col.label}{sortKey === col.key ? (sortDir === 1 ? ' ▲' : ' ▼') : ''}
+                          </th>
+                        ))}
+                        <th style={{ textAlign: 'left', borderBottom: '1px solid #334155', padding: 6 }}>Flags</th>
+                      </tr></thead>
+                      <tbody>
+                        {g.rows.map((c, i) => (
+                          <tr key={`${c.agentId}-${c.local}-${c.remote}-${c.pid}-${i}`} onClick={() => openRow(c)} style={rowStyle(c)}>
+                            {visibleCols.map(col => <td key={col} style={{ padding: 6, maxWidth: 300 }}>{cellFor(c, col)}</td>)}
+                            <td style={{ padding: 6 }}>{c.flags.join(', ')}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    <p style={{ fontSize: 12, color: '#94a3b8' }}>Click any socket for its full detail — executable, command line, parent, unit/container, timestamps, kill, and IP info.</p>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+          {groups.length === 0 && <p style={{ color: '#94a3b8' }}>No groups match. Try Attention → All, or clear the search.</p>}
+        </div>
+      ) : (
+        <div className="ng-table-wrap">
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+            <thead><tr>
+              {COLUMNS.filter(col => visibleCols.includes(col.key)).map(col => (
+                <th key={col.key} onClick={() => toggleSort(col.key)} style={{ textAlign: 'left', borderBottom: '1px solid #334155', padding: 6, cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                  {col.label}{sortKey === col.key ? (sortDir === 1 ? ' ▲' : ' ▼') : ''}
+                </th>
+              ))}
+              <th style={{ textAlign: 'left', borderBottom: '1px solid #334155', padding: 6 }}>Flags</th>
+            </tr></thead>
+            <tbody>
+              {filtered.map((c, i) => (
+                <tr key={`${c.agentId}-${c.local}-${c.remote}-${c.pid}-${i}`} onClick={() => openRow(c)} style={rowStyle(c)}>
+                  {visibleCols.map(col => <td key={col} style={{ padding: 6, maxWidth: 300 }}>{cellFor(c, col)}</td>)}
+                  <td style={{ padding: 6 }}>{c.flags.join(', ')}</td>
+                </tr>
+              ))}
+              {filtered.length === 0 && <tr><td colSpan={visibleCols.length + 1} style={{ padding: 12, color: '#94a3b8' }}>No connections match. Try Attention → All, or clear the filters.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      )}
+      </>)}
+
+      {nav === 'alerts' && (
+        <div style={{ ...card, marginBottom: 12 }}>
+          <h2 style={{ marginTop: 0 }}>Alerts</h2>
+          <p style={{ color: '#94a3b8' }}>Rule hits saved by the server (latest 200). Apprise notifications, if configured, fire for the same hits. Click “Find connection” to jump to that connection in the flat Agents list — if it has already closed, it will be a ghost or gone, and this alert is the remaining record.</p>
+          {alerts.map((a, i) => (
+            <div key={`${a.at}-${i}`} style={{ border: '1px solid #1e3a5f', borderRadius: 8, padding: 10, marginBottom: 8 }}>
+              <strong>{a.rule}</strong> <span style={{ color: '#94a3b8', fontSize: 13 }}>{a.at ? new Date(a.at).toLocaleString() : ''} · {a.agent}</span>
+              <div style={{ fontSize: 14, marginTop: 4 }}>{a.message}</div>
+              {a.detail && <div style={{ fontSize: 12, color: '#94a3b8' }}>{a.detail}</div>}
+              <button style={{ marginTop: 6 }} onClick={() => {
+                const ag = agents.find(x => x.name === a.agent)
+                if (ag) setAgentFilter(ag.id)
+                const pid = a.detail.split(' ')[0]
+                if (/^\d+$/.test(pid)) setQ(pid)
+                setGrouped(false); setView('all'); setNav('agents')
+              }}>Find connection →</button>
+            </div>
+          ))}
+          {alerts.length === 0 && <p style={{ color: '#94a3b8' }}>No rule alerts yet.</p>}
+        </div>
+      )}
+
+      {nav === 'manage' && (<>
         <div style={{ ...card, borderColor: '#2563eb', boxShadow: '0 0 24px rgba(37, 99, 235, 0.25)', marginBottom: 12 }}>
           <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
             <span style={{ fontSize: 28, background: '#2563eb', borderRadius: '50%', padding: 10 }}>▣</span>
             <div><h3 style={{ margin: 0 }}>Add an agent</h3><p style={{ color: '#94a3b8', margin: '4px 0 0' }}>Monitor another host or docker container on your network.</p></div>
           </div>
           <div style={{ marginTop: 12 }}>
-          <input value={newAgentName} onChange={e => setNewAgentName(e.target.value)} placeholder="Agent name, e.g. debian-server" style={inputStyle} />
-          <button className="primary" onClick={createAgent} style={{ marginLeft: 8, background: 'linear-gradient(90deg, #2563eb, #0ea5e9)', color: '#fff', border: 'none', borderRadius: 10, padding: '8px 14px', cursor: 'pointer' }}>▶ Generate Docker compose</button>
+            <input value={newAgentName} onChange={e => setNewAgentName(e.target.value)} placeholder="Agent name, e.g. debian-server" style={inputStyle} />
+            <button className="primary" onClick={createAgent} style={{ marginLeft: 8, background: 'linear-gradient(90deg, #2563eb, #0ea5e9)', color: '#fff', border: 'none', borderRadius: 10, padding: '8px 14px', cursor: 'pointer' }}>▶ Generate Docker compose</button>
           </div>
           <p style={{ color: '#94a3b8' }}>Windows: download the release exe and run it with <code>--server {window.location.origin} --token &lt;token&gt;</code>, or run it with no arguments and enter the server and token when prompted.</p>
           {compose && <><textarea value={compose} readOnly rows={16} style={{ width: '100%', fontFamily: 'monospace' }} />
             <button onClick={() => navigator.clipboard.writeText(compose)}>Copy compose</button>
             <button onClick={() => { const blob = new Blob([compose], { type: 'text/yaml' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'docker-compose.netglass-agent.yml'; a.click() }}>Download compose</button></>}
         </div>
-      )}
 
-      <div style={{ ...card, marginBottom: 12 }}>
-        <strong>Recording:</strong>{' '}
-        {activeRecording
-          ? <><span>● Recording “{activeRecording.name}” — {activeRecording.eventCount} events</span>{' '}
-              <button onClick={() => stopRecording(activeRecording.id)}>Stop</button></>
-          : <><input value={recordingName} onChange={e => setRecordingName(e.target.value)} placeholder="Recording name" />{' '}
-              <button className="primary" onClick={startRecording}>Start recording</button></>}
-        <div style={{ marginTop: 8 }}>
-          {recordings.map(r => (
-            <span key={r.id} style={{ marginRight: 12, fontSize: 13 }}>
-              {r.name} ({r.eventCount} events, {r.endedAt ? 'ended' : 'active'}){' '}
-              <a href={`/api/recordings/${r.id}/export`}>Export CSV</a>
-            </span>
-          ))}
-        </div>
-      </div>
-
-      <div style={{ ...card, marginBottom: 12 }}>
-        <strong>Agents</strong>
-        <span style={{ color: '#94a3b8', fontSize: 12 }}> — last updated {lastUpdated ? lastUpdated.toLocaleTimeString() : 'never'}{paused ? ' (paused)' : ''}</span>
-        {agents.length === 0 && <span style={{ color: '#94a3b8' }}> — none connected, click Add agent above.</span>}
-        {agents.map(a => (
-          <div key={a.id} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginTop: 6, fontSize: 13 }}>
-            <span><strong>{a.name}</strong> ({a.hostname || a.id.slice(0, 8)}) — {a.os || 'unknown OS'} — last seen {a.lastSeen ? new Date(a.lastSeen).toLocaleTimeString() : 'never'}, {a.socketCount} sockets</span>
-            <button
-              className={deleteConfirmId === a.id ? 'danger' : undefined}
-              onClick={() => deleteAgent(a.id, a.name)}
-              title="Revoke this agent's token and remove its live connections. Recordings and alerts are kept."
-            >
-              {deleteConfirmId === a.id ? 'Click again to confirm delete' : 'Delete agent'}
-            </button>
-          </div>
-        ))}
-        {deleteStatus && <div style={{ fontSize: 13, marginTop: 6 }}>{deleteStatus}</div>}
-        <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 4 }}>
-          Deleting revokes the agent's token and removes its live connections. A still-running agent will be rejected until re-registered. Recordings and alerts from it are kept as history.
-        </div>
-      </div>
-
-      {view === 'incoming' && (
-        <div style={{ marginBottom: 16 }}>
-          <h3>Local services being connected to</h3>
-          {groupedIncoming.map(g => (
-            <div key={g.service + g.process} style={{ border: '1px solid #1e293b', borderRadius: 6, padding: 8, marginBottom: 6 }}>
-              <strong>{g.process}</strong> on {g.service} {g.unit && `(${g.unit})`} {g.container && `[${g.container}]`} —{' '}
-              {g.remotes.size} distinct remote(s), {g.count} socket(s)
-              <div style={{ color: '#94a3b8', fontSize: 12 }}>{[...g.remotes].slice(0, 10).join(', ')}{g.remotes.size > 10 ? '…' : ''}</div>
+        <div style={{ ...card, marginBottom: 12 }}>
+          <strong>Agents</strong>
+          <span style={{ color: '#94a3b8', fontSize: 12 }}> — last updated {lastUpdated ? lastUpdated.toLocaleTimeString() : 'never'}{paused ? ' (paused)' : ''}</span>
+          {agents.length === 0 && <span style={{ color: '#94a3b8' }}> — none connected.</span>}
+          {agents.map(a => (
+            <div key={a.id} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginTop: 6, fontSize: 13 }}>
+              <span><strong>{a.name}</strong> ({a.hostname || a.id.slice(0, 8)}) — {a.os || 'unknown OS'} — last seen {a.lastSeen ? new Date(a.lastSeen).toLocaleTimeString() : 'never'}, {a.socketCount} sockets</span>
+              <button
+                className={deleteConfirmId === a.id ? 'danger' : undefined}
+                onClick={() => deleteAgent(a.id, a.name)}
+                title="Revoke this agent's token and remove its live connections. Recordings and alerts are kept."
+              >
+                {deleteConfirmId === a.id ? 'Click again to confirm delete' : 'Delete agent'}
+              </button>
             </div>
           ))}
-          {groupedIncoming.length === 0 && <p style={{ color: '#94a3b8' }}>No incoming or listening connections in the current filter.</p>}
+          {deleteStatus && <div style={{ fontSize: 13, marginTop: 6 }}>{deleteStatus}</div>}
+          <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 4 }}>
+            Deleting revokes the agent's token and removes its live connections. A still-running agent will be rejected until re-registered. Recordings and alerts from it are kept as history.
+          </div>
         </div>
-      )}
-
-      <div className="ng-table-wrap">
-      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-        <thead><tr>
-          {COLUMNS.map(col => (
-            <th key={col.key} onClick={() => toggleSort(col.key)} style={{ textAlign: 'left', borderBottom: '1px solid #334155', padding: 6, cursor: 'pointer', whiteSpace: 'nowrap' }}>
-              {col.label}{sortKey === col.key ? (sortDir === 1 ? ' ▲' : ' ▼') : ''}
-            </th>
-          ))}
-          <th style={{ textAlign: 'left', borderBottom: '1px solid #334155', padding: 6 }}>Flags</th>
-        </tr></thead>
-        <tbody>
-          {filtered.map((c, i) => (
-            <tr key={`${c.agentId}-${c.local}-${c.remote}-${c.pid}-${i}`} onClick={() => { setSelected(c); setConfirmKill(false); setKillStatus('') }}
-              style={{ background: c.suspicious ? '#450a0a' : c.isGhost ? '#1e293b' : undefined, opacity: c.isGhost ? 0.6 : 1, cursor: 'pointer' }}>
-              <td style={{ padding: 6 }}>{c.agentName}</td>
-              <td style={{ padding: 6 }}>{c.direction}{c.isGhost ? ' (closed)' : ''}</td>
-              <td style={{ padding: 6 }}><strong>{c.process}</strong> <span style={{ color: '#94a3b8' }}>pid {c.pid ?? ''}</span></td>
-              <td style={{ padding: 6, maxWidth: 280, color: c.detail ? '#e2e8f0' : '#64748b' }}>{c.detail || '—'}</td>
-              <td style={{ padding: 6, maxWidth: 300, overflowWrap: 'anywhere' }}>{c.exe}</td>
-              <td style={{ padding: 6 }}>{c.local}</td>
-              <td style={{ padding: 6 }}>{c.remote}{c.remoteHost ? <><br /><span style={{ color: '#94a3b8' }}>{c.remoteHost}</span></> : null}</td>
-              <td style={{ padding: 6 }}>{c.state}</td>
-              <td style={{ padding: 6 }}>{c.firstSeen ? new Date(c.firstSeen).toLocaleString() : ''}</td>
-              <td style={{ padding: 6 }}>{c.lastSeen ? new Date(c.lastSeen).toLocaleString() : ''}</td>
-              <td style={{ padding: 6 }}>{c.flags.join(', ')}</td>
-            </tr>
-          ))}
-          {filtered.length === 0 && <tr><td colSpan={11} style={{ padding: 12, color: '#94a3b8' }}>No connections match. Connect an agent, or clear the filters.</td></tr>}
-        </tbody>
-      </table>
-      </div>
       </>)}
 
       {nav === 'recordings' && (
@@ -489,6 +614,7 @@ export default function App() {
           <h2 style={{ marginTop: 0 }}>About NetGlass</h2>
           <p>Local-first process network visibility. No cloud. Agents on each host report their sockets — process, executable, command line, parent, systemd unit or container, and remote destination — to this central server, which shows them live, with ghosts for recently-closed connections, recordings for review, and Apprise alerts for patterns.</p>
           <ul style={{ fontSize: 14, lineHeight: 1.6 }}>
+            <li>Attention is the default view — only suspicious, new, public, or uncommon-port rows. Grouped by service by default; switch to All sockets for the flat list. Neither hides anything: expand a group, click a socket, and the drawer still shows the full executable, command line, parent, unit/container, timestamps, kill, and IP info.</li>
             <li>Click a row for the full story, including how to kill that process (with a PID + exe + start-time re-check on the agent).</li>
             <li>Reverse DNS is filled in automatically from the local resolver and cached. ip-api.com enrichment is only fetched when you click Fetch for a specific IP, then cached for 30 days.</li>
             <li>Delete an agent from the Agents panel to revoke its token. Recordings and alerts are kept as history.</li>
@@ -508,16 +634,26 @@ export default function App() {
               <strong>What this is:</strong> {selected.detail}
             </div>
           )}
-          <h3>Exactly what made this (outgoing) / is being hit (incoming)</h3>
-          <dl style={{ fontSize: 13 }}>
-            <dt>Executable</dt><dd style={{ overflowWrap: 'anywhere' }}>{selected.exe || '—'} <button onClick={() => navigator.clipboard.writeText(selected.exe)}>Copy</button></dd>
-            <dt>Command line</dt><dd style={{ overflowWrap: 'anywhere' }}>{selected.cmdline || '—'}</dd>
-            <dt>Parent</dt><dd>{selected.parent} (pid {selected.ppid ?? ''}) — {selected.parentExe || '—'}</dd>
-            <dt>User / unit / container</dt><dd>{selected.user || '—'} / {selected.unit || '—'} / {selected.container || selected.containerId || '—'}</dd>
-            <dt>Process started</dt><dd>{selected.started ? new Date(selected.started).toLocaleString() : '—'}</dd>
-            <dt>First / last seen</dt><dd>{selected.firstSeen ? new Date(selected.firstSeen).toLocaleString() : ''} / {selected.lastSeen ? new Date(selected.lastSeen).toLocaleString() : ''}</dd>
-            <dt>Flags</dt><dd>{selected.flags.join(', ') || '—'}</dd>
-          </dl>
+          {selected.flags.length > 0 && (
+            <div style={{ border: '1px solid #f59e0b', borderRadius: 8, padding: 10, marginBottom: 12 }}>
+              <strong>Why it matters:</strong>
+              <ul style={{ fontSize: 13, margin: '6px 0 0', paddingLeft: 18 }}>
+                {selected.flags.map(f => <li key={f}><strong>{f}</strong> — {flagWhy[f] ?? 'Flagged by the agent.'}</li>)}
+              </ul>
+            </div>
+          )}
+          <details open style={{ marginBottom: 12 }}>
+            <summary style={{ cursor: 'pointer', fontWeight: 700 }}>Raw detail — exactly what made this / is being hit</summary>
+            <dl style={{ fontSize: 13 }}>
+              <dt>Executable</dt><dd style={{ overflowWrap: 'anywhere' }}>{selected.exe || '—'} <button onClick={() => navigator.clipboard.writeText(selected.exe)}>Copy</button></dd>
+              <dt>Command line</dt><dd style={{ overflowWrap: 'anywhere' }}>{selected.cmdline || '—'}</dd>
+              <dt>Parent</dt><dd>{selected.parent} (pid {selected.ppid ?? ''}) — {selected.parentExe || '—'}</dd>
+              <dt>User / unit / container</dt><dd>{selected.user || '—'} / {selected.unit || '—'} / {selected.container || selected.containerId || '—'}</dd>
+              <dt>Process started</dt><dd>{selected.started ? new Date(selected.started).toLocaleString() : '—'}</dd>
+              <dt>First / last seen</dt><dd>{selected.firstSeen ? new Date(selected.firstSeen).toLocaleString() : ''} / {selected.lastSeen ? new Date(selected.lastSeen).toLocaleString() : ''}</dd>
+              <dt>Flags</dt><dd>{selected.flags.join(', ') || '—'}</dd>
+            </dl>
+          </details>
           <h3>IP info — {parseIp(selected.remote) ?? 'no remote IP'} (ip-api.com, on demand)</h3>
           <p style={{ fontSize: 12, color: '#94a3b8' }}>
             Reverse DNS for the remote IP is filled in automatically from the server's local resolver and cached.
