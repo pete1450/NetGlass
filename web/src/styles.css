@@ -11,7 +11,7 @@ img,svg{max-width:100%}
    left-bottom so the network nodes sit at the foot of the sidebar
    and the dark top stays behind the logo/nav. The gradient overlay
    keeps nav text readable over the bright nodes at the bottom. */
-.ng-sidebar{background-image:linear-gradient(180deg, rgba(4,12,28,0.35) 0%, rgba(4,12,28,0.55) 60%, rgba(4,12,28,0.75) 100%), url(/sidebar-bg.png);background-size:cover;background-position:left bottom;background-repeat:no-repeat}
+.ng-sidebar{background-image:linear-gradient(180deg, rgba(4,12,28,0.35) 0%, rgba(4,12,28,0.55) 60%, rgba(4,12,28,0.75) 100%), url(/sidebar-bg.png);background-size:cover;background-position:left bottom;background-repeat:no-repeat;position:sticky;top:0;height:100vh;overflow-y:auto;align-self:flex-start}
 
 /* Table: never let a 10-column table force the whole page sideways.
    On narrow screens it scrolls inside its own wrapper, so the
@@ -22,7 +22,7 @@ img,svg{max-width:100%}
 /* ---- Mobile: sidebar becomes a top bar, everything stacks -------- */
 @media (max-width: 900px){
   .ng-layout{flex-direction:column !important}
-  .ng-sidebar{width:auto !important;flex-direction:row !important;flex-wrap:wrap !important;align-items:center !important;border-right:none !important;border-bottom:1px solid #1e293b !important;padding:12px !important;gap:12px !important;background-image:none !important;background-color:#040c1c !important}
+  .ng-sidebar{width:auto !important;flex-direction:row !important;flex-wrap:wrap !important;align-items:center !important;border-right:none !important;border-bottom:1px solid #1e293b !important;padding:12px !important;gap:12px !important;background-image:none !important;background-color:#040c1c !important;position:static !important;height:auto !important;overflow:visible !important;align-self:auto !important}
   .ng-logo{display:flex !important;align-items:center !important;gap:10px !important;margin-bottom:0 !important}
   .ng-logo svg{width:40px !important;height:40px !important}
   .ng-logo img{width:40px !important;height:40px !important}

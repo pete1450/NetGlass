@@ -190,7 +190,12 @@ sketchy happening, and if so, what exactly is it?"
   2× the 230px sidebar, so it stays sharp at 304 KB instead of
   1.4 MB). Anchored left-bottom so the network nodes sit at the
   foot of the sidebar under the footer, with a dark gradient
-  overlay (35% top → 75% bottom) keeping nav text readable. On
+  overlay (35% top → 75% bottom) keeping nav text readable. The
+  sidebar is pinned to the viewport (`position: sticky`, 100vh,
+  its own scroll if the nav overflows) — it does not stretch to
+  the page height, so the background no longer scales down a long
+  table and the network nodes stay in view while the main content
+  scrolls. On
   mobile, where the sidebar becomes a top bar, the background is
   replaced with a solid dark colour for readability.
 - **Delete agent (Agents panel, `DELETE /api/agents/{id}`):** two-click
