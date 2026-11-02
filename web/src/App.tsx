@@ -10,7 +10,9 @@ type Conn = {
   isGhost: boolean; isNew: boolean; suspicious: boolean; flags: string[]
   detail?: string; signature?: string
   score?: number; tier?: string; findings?: Finding[]
+  isWhitelisted?: boolean; isHidden?: boolean
 }
+type AppPref = { agentId: string; agentName: string; exe: string; process: string; kind: string; createdAt: string }
 type Finding = {
   ruleId: string; title: string; category: string; engine: string
   severity: string; score: number; evidence: string; explanation: string
@@ -66,12 +68,15 @@ export default function App() {
   const [recordings, setRecordings] = useState<Recording[]>([])
   const [alerts, setAlerts] = useState<AlertItem[]>([])
   const [checks, setChecks] = useState<CheckItem[]>([])
+  const [appPrefs, setAppPrefs] = useState<AppPref[]>([])
+  const [showHidden, setShowHidden] = useState(false)
+  const [prefStatus, setPrefStatus] = useState('')
   // Triage-first: Attention is the default view. It shows only rows
   // with a reason to care (suspicious, new, public, uncommon port).
   // All / flat is always one tap away, and the drawer still carries
   // the full detail for every row — nothing is hidden, only grouped.
   const [view, setView] = useState<'attention' | 'all' | 'outgoing' | 'incoming' | 'listeners' | 'suspicious'>('attention')
-  const [nav, setNav] = useState<'agents' | 'alerts' | 'checks' | 'manage' | 'recordings' | 'settings' | 'about'>('agents')
+  const [nav, setNav] = useState<'agents' | 'alerts' | 'checks' | 'prefs' | 'manage' | 'recordings' | 'settings' | 'about'>('agents')
   const [grouped, setGrouped] = useState(true)
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
   const [showColumns, setShowColumns] = useState(false)
@@ -106,19 +111,21 @@ export default function App() {
 
   const load = useCallback(async () => {
     try {
-      const [c, a, r, al, ch] = await Promise.all([
-        fetch('/api/connections').then(x => x.json()),
+      const [c, a, r, al, ch, pr] = await Promise.all([
+        fetch(showHidden ? '/api/connections?includeHidden=true' : '/api/connections').then(x => x.json()),
         fetch('/api/agents').then(x => x.json()),
         fetch('/api/recordings').then(x => x.json()),
         fetch('/api/alerts').then(x => x.json()).catch(() => []),
         fetch('/api/checks').then(x => x.json()).catch(() => []),
+        fetch('/api/app-prefs').then(x => x.json()).catch(() => []),
       ])
       setConns(c.connections ?? []); setCounts(c.counts ?? {})
       setAgents(a ?? []); setRecordings(r ?? []); setAlerts(Array.isArray(al) ? al : [])
       setChecks(Array.isArray(ch) ? ch : [])
+      setAppPrefs(Array.isArray(pr) ? pr : [])
       setLastUpdated(new Date())
     } catch { /* server down: keep last state, UI shows stale counts */ }
-  }, [])
+  }, [showHidden])
 
   useEffect(() => {
     try { localStorage.setItem('ng-columns', JSON.stringify(visibleCols)) } catch { /* private mode */ }
@@ -142,17 +149,18 @@ export default function App() {
   }, [])
 
   const isAttention = (c: Conn) =>
+    !c.isWhitelisted && !c.isHidden && (
     c.tier === 'High' || c.tier === 'Medium' || c.suspicious || c.isNew ||
     c.flags.includes('PUBLIC') || c.flags.includes('UNCOMMON_PORT') ||
-    c.flags.includes('TMP_EXE') || c.flags.includes('DELETED_EXE') || c.flags.includes('NO_EXE')
+    c.flags.includes('TMP_EXE') || c.flags.includes('DELETED_EXE') || c.flags.includes('NO_EXE'))
 
   const filtered = useMemo(() => {
-    let rows = conns
+    let rows = showHidden ? conns : conns.filter(c => !c.isHidden)
     if (view === 'attention') rows = rows.filter(isAttention)
     if (view === 'outgoing') rows = rows.filter(c => c.direction === 'outbound')
     if (view === 'incoming') rows = rows.filter(c => c.direction === 'inbound' || c.direction === 'listen')
     if (view === 'listeners') rows = rows.filter(c => c.direction === 'listen')
-    if (view === 'suspicious') rows = rows.filter(c => c.suspicious)
+    if (view === 'suspicious') rows = rows.filter(c => c.suspicious && !c.isWhitelisted && !c.isHidden)
     if (agentFilter) rows = rows.filter(c => c.agentId === agentFilter)
     if (q) {
       const needle = q.toLowerCase()
@@ -168,7 +176,7 @@ export default function App() {
       return av.localeCompare(bv) * sortDir
     })
     return sorted
-  }, [conns, view, agentFilter, q, sortKey, sortDir])
+  }, [conns, view, agentFilter, q, sortKey, sortDir, showHidden])
 
   // Grouped view: collapse repeats of the same service into one row.
   // Grouping is display-only — expanding a group shows its individual
@@ -187,10 +195,11 @@ export default function App() {
   }, [filtered])
 
   const summary = useMemo(() => {
-    const suspicious = conns.filter(c => c.suspicious).length
-    const newListeners = conns.filter(c => c.isNew && c.direction === 'listen').length
-    const publicListeners = conns.filter(c => c.flags.includes('PUBLIC')).length
-    const newDestinations = conns.filter(c => c.isNew && c.direction === 'outbound').length
+    const live = conns.filter(c => !c.isWhitelisted && !c.isHidden)
+    const suspicious = live.filter(c => c.suspicious).length
+    const newListeners = live.filter(c => c.isNew && c.direction === 'listen').length
+    const publicListeners = live.filter(c => c.flags.includes('PUBLIC')).length
+    const newDestinations = live.filter(c => c.isNew && c.direction === 'outbound').length
     const parts: string[] = []
     if (suspicious) parts.push(`${suspicious} suspicious`)
     if (newListeners) parts.push(`${newListeners} new listener${newListeners === 1 ? '' : 's'}`)
@@ -230,6 +239,35 @@ export default function App() {
     setAgents(prev => prev.filter(a => a.id !== id))
     if (agentFilter === id) setAgentFilter('')
     setSelected(prev => (prev && prev.agentId === id ? null : prev))
+  }
+
+  // Hide / whitelist actions. Identity is agent + exe path, so
+  // hiding an app on one host does not affect the same app on
+  // another. Apps with no exe path cannot be acted on: an empty
+  // exe key would match every unknown process on that host.
+  // Restoring is a DELETE of the pref; it takes effect on the
+  // next agent snapshot (~2s), with history intact.
+  async function setAppPref(agentId: string, exe: string, process: string, kind: 'hide' | 'whitelist') {
+    const res = await fetch('/api/app-prefs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agentId, exe, process, kind }) })
+    if (!res.ok) { setPrefStatus('Could not save that preference.'); return }
+    setPrefStatus(kind === 'hide'
+      ? `Hidden ${process || exe} — its connections will disappear from Agents, Attention and alerts on the next snapshot. Recordings are kept, and you can restore it from Hidden & whitelisted.`
+      : `Whitelisted ${process || exe} — its connections stay visible but are no longer scored and will not appear in Attention or trigger alerts.`)
+    setSelected(null); load()
+  }
+  async function clearAppPref(agentId: string, exe: string, process: string) {
+    await fetch(`/api/app-prefs?agentId=${encodeURIComponent(agentId)}&exe=${encodeURIComponent(exe)}`, { method: 'DELETE' })
+    setPrefStatus(`Restored ${process || exe} — normal scoring and display resume on the next snapshot.`)
+    setSelected(null); load()
+  }
+  async function restoreAllPrefs(kind: 'hide' | 'whitelist') {
+    const targets = appPrefs.filter(p => p.kind === kind)
+    for (const p of targets)
+      await fetch(`/api/app-prefs?agentId=${encodeURIComponent(p.agentId)}&exe=${encodeURIComponent(p.exe)}`, { method: 'DELETE' })
+    setPrefStatus(targets.length
+      ? `Restored all ${targets.length} ${kind === 'hide' ? 'hidden' : 'whitelisted'} app${targets.length === 1 ? '' : 's'}.`
+      : `Nothing to restore.`)
+    load()
   }
 
   // Cached IP info for the selected row's remote IP. GET never calls
@@ -305,8 +343,8 @@ export default function App() {
     switch (key) {
       case 'agentName': return c.agentName
       case 'direction': return <>{c.direction}{c.isGhost ? ' (closed)' : ''}</>
-      case 'process': return <><strong>{c.process}</strong> <span style={{ color: '#94a3b8' }}>pid {c.pid ?? ''}</span></>
-      case 'score': return (c.score ?? 0) > 0 ? <><strong style={{ color: c.tier === 'High' ? '#f87171' : c.tier === 'Medium' ? '#fbbf24' : '#94a3b8' }}>{c.score}</strong> <span style={{ color: '#94a3b8', fontSize: 12 }}>{c.tier}</span></> : '—'
+      case 'process': return <><strong>{c.process}</strong> <span style={{ color: '#94a3b8' }}>pid {c.pid ?? ''}</span>{c.isHidden ? <span style={{ color: '#94a3b8', fontSize: 12 }}> · Hidden</span> : null}{c.isWhitelisted ? <span style={{ color: '#34d399', fontSize: 12 }}> · Whitelisted</span> : null}</>
+      case 'score': return c.isWhitelisted ? <span style={{ color: '#34d399', fontSize: 12 }}>Whitelisted</span> : (c.score ?? 0) > 0 ? <><strong style={{ color: c.tier === 'High' ? '#f87171' : c.tier === 'Medium' ? '#fbbf24' : '#94a3b8' }}>{c.score}</strong> <span style={{ color: '#94a3b8', fontSize: 12 }}>{c.tier}</span></> : '—'
       case 'detail': return <span style={{ color: c.detail ? '#e2e8f0' : '#64748b' }}>{c.detail || '—'}</span>
       case 'exe': return <span style={{ overflowWrap: 'anywhere' }}>{c.exe}</span>
       case 'local': return c.local
@@ -317,8 +355,8 @@ export default function App() {
     }
   }
   const rowStyle = (c: Conn): React.CSSProperties => ({
-    background: c.suspicious ? '#450a0a' : c.isGhost ? '#1e293b' : undefined,
-    opacity: c.isGhost ? 0.6 : 1, cursor: 'pointer',
+    background: c.suspicious && !c.isWhitelisted ? '#450a0a' : c.isGhost ? '#1e293b' : undefined,
+    opacity: (c.isGhost || c.isHidden) ? 0.6 : 1, cursor: 'pointer',
     borderLeft: c.tier === 'High' ? '4px solid #ef4444' : c.tier === 'Medium' ? '4px solid #f59e0b' : isAttention(c) ? '4px solid #f59e0b' : '4px solid transparent',
   })
   const openRow = (c: Conn) => { setSelected(c); setConfirmKill(false); setKillStatus('') }
@@ -350,6 +388,7 @@ export default function App() {
         {navItem('agents', 'Agents', '▣')}
         {navItem('alerts', `Alerts${alerts.length ? ` (${alerts.length})` : ''}`, '⚠')}
         {navItem('checks', 'Checks', '⬡')}
+        {navItem('prefs', `Hidden & whitelisted${appPrefs.length ? ` (${appPrefs.length})` : ''}`, '🛡')}
         {navItem('manage', 'Manage agents', '⚙')}
         {navItem('recordings', 'Recordings', '▶')}
         {navItem('settings', 'Settings', '⚙')}
@@ -373,6 +412,14 @@ export default function App() {
             {grouped ? '▤ Grouped by service' : '☰ All sockets (flat)'}
           </button>
           <button onClick={() => setShowColumns(v => !v)} style={{ ...card, cursor: 'pointer' }}>Columns ▾</button>
+          <button onClick={() => setShowHidden(v => !v)} style={{ ...card, cursor: 'pointer' }}>
+            {showHidden ? '👁 Showing hidden apps' : '⊘ Show hidden apps'}
+          </button>
+        </div>
+      )}
+      {prefStatus && nav === 'agents' && (
+        <div style={{ ...card, marginBottom: 12 }}>
+          {prefStatus} <button onClick={() => setPrefStatus('')}>Dismiss</button>
         </div>
       )}
 
@@ -380,8 +427,8 @@ export default function App() {
       <div className="ng-stats" style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
         {([
           ['Total', counts.total, '🖥'], ['Outbound', counts.outbound, '✓'], ['Inbound', counts.inbound, '←'],
-          ['Listeners', counts.listen, '👥'], ['Suspicious', conns.filter(c => c.suspicious).length, '⬡'],
-          ['New (24h)', conns.filter(c => c.isNew).length, '◷'],
+          ['Listeners', counts.listen, '👥'], ['Suspicious', conns.filter(c => c.suspicious && !c.isWhitelisted && !c.isHidden).length, '⬡'],
+          ['New (24h)', conns.filter(c => c.isNew && !c.isWhitelisted && !c.isHidden).length, '◷'],
           ['Ghosts', conns.filter(c => c.isGhost).length, '👻'],
         ] as const).map(([label, value, icon]) => (
           <div key={label} style={{ ...card, textAlign: 'left', display: 'flex', gap: 10, alignItems: 'center', flex: '1 1 110px' }}>
@@ -625,6 +672,49 @@ export default function App() {
         </div>
       )}
 
+      {nav === 'prefs' && (
+        <div style={{ ...card, marginBottom: 12 }}>
+          <h2 style={{ marginTop: 0 }}>Hidden &amp; whitelisted apps</h2>
+          <p style={{ color: '#94a3b8' }}>
+            Nothing here is deleted. <strong>Hidden</strong> apps disappear from Agents, Attention, counts and rule alerts, but are still
+            collected and recorded — restoring one brings it back with its history intact. <strong>Whitelisted</strong> apps stay visible,
+            but their connections are never scored, never appear in Attention, and never trigger rule alerts. Use whitelist for known-good
+            noisy apps, hide for apps you simply do not want to look at. A preference applies to one agent + executable path only, so the
+            same app on another host is unaffected. Changes take effect on the next agent snapshot (about 2 seconds).
+          </p>
+          {prefStatus && <div style={{ marginBottom: 12 }}>{prefStatus}</div>}
+          {(['hide', 'whitelist'] as const).map(kind => (
+            <div key={kind} style={{ marginBottom: 16 }}>
+              <h3>{kind === 'hide' ? 'Hidden apps' : 'Whitelisted apps'}</h3>
+              {appPrefs.filter(p => p.kind === kind).length === 0 && (
+                <p style={{ color: '#94a3b8', fontSize: 13 }}>
+                  {kind === 'hide' ? 'No hidden apps. Hide one from its detail drawer on the Agents page.' : 'No whitelisted apps. Whitelist one from its detail drawer on the Agents page.'}
+                </p>
+              )}
+              {appPrefs.filter(p => p.kind === kind).map(p => (
+                <div key={`${p.agentId}|${p.exe}`} style={{ border: '1px solid #1e3a5f', borderRadius: 8, padding: 10, marginBottom: 8, fontSize: 13 }}>
+                  <strong>{p.process || p.exe}</strong> <span style={{ color: '#94a3b8' }}>on {p.agentName || p.agentId.slice(0, 8)} · since {p.createdAt ? new Date(p.createdAt).toLocaleString() : ''}</span>
+                  <div style={{ overflowWrap: 'anywhere', color: '#94a3b8', marginTop: 4 }}>{p.exe}</div>
+                  <div style={{ marginTop: 6, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <button onClick={() => clearAppPref(p.agentId, p.exe, p.process)}>Restore app</button>
+                    <button onClick={() => setAppPref(p.agentId, p.exe, p.process, kind === 'hide' ? 'whitelist' : 'hide')}>
+                      {kind === 'hide' ? 'Whitelist instead' : 'Hide instead'}
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {appPrefs.filter(p => p.kind === kind).length > 0 && (
+                <button onClick={() => restoreAllPrefs(kind)}>Restore all {kind === 'hide' ? 'hidden' : 'whitelisted'} apps</button>
+              )}
+            </div>
+          ))}
+          <p style={{ fontSize: 12, color: '#94a3b8' }}>
+            Lost something? Turn on “Show hidden apps” on the Agents page to see hidden rows muted in the list, or restore them here.
+            Deleting an agent also removes its app preferences.
+          </p>
+        </div>
+      )}
+
       {nav === 'settings' && (
         <div style={{ ...card, marginBottom: 12, maxWidth: 700 }}>
           <h2 style={{ marginTop: 0 }}>Settings</h2>
@@ -658,6 +748,7 @@ export default function App() {
             <li>Reverse DNS is filled in automatically from the local resolver and cached. ip-api.com enrichment is only fetched when you click Fetch for a specific IP, then cached for 30 days.</li>
             <li>Delete an agent from the Agents panel to revoke its token. Recordings and alerts are kept as history.</li>
             <li>Pause freezes the displayed snapshot without losing anything — the server keeps collecting.</li>
+            <li>Hide or whitelist an app from its detail drawer: hidden apps vanish from the list (but are still recorded), whitelisted apps stay visible but are never scored. Both are reversible in one click from Hidden &amp; whitelisted, or by restoring all of a kind at once.</li>
           </ul>
           <button onClick={() => setNav('agents')}>← Back to Agents</button>
         </div>
@@ -740,6 +831,29 @@ export default function App() {
             </div>
           )}
           {ipInfoMsg && <p style={{ fontSize: 13 }}>{ipInfoMsg}</p>}
+          <h3>Hide or whitelist this app</h3>
+          {selected.isWhitelisted && <p style={{ fontSize: 13, color: '#34d399' }}>This app is whitelisted — its connections are not scored and will not appear in Attention or trigger alerts.</p>}
+          {selected.isHidden && <p style={{ fontSize: 13, color: '#94a3b8' }}>This app is hidden — it only appears here because “Show hidden apps” is on.</p>}
+          {!selected.exe && <p style={{ fontSize: 13, color: '#94a3b8' }}>This app has no executable path, so it cannot be hidden or whitelisted — an empty path would match every unknown process on this host.</p>}
+          {selected.exe && !selected.isWhitelisted && !selected.isHidden && (
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+              <button onClick={() => setAppPref(selected.agentId, selected.exe, selected.process, 'hide')}>Hide this app</button>
+              <button onClick={() => setAppPref(selected.agentId, selected.exe, selected.process, 'whitelist')}>Whitelist this app</button>
+            </div>
+          )}
+          {selected.exe && selected.isWhitelisted && (
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+              <button onClick={() => clearAppPref(selected.agentId, selected.exe, selected.process)}>Restore app (resume scoring)</button>
+              <button onClick={() => setAppPref(selected.agentId, selected.exe, selected.process, 'hide')}>Hide instead</button>
+            </div>
+          )}
+          {selected.exe && selected.isHidden && (
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+              <button onClick={() => clearAppPref(selected.agentId, selected.exe, selected.process)}>Restore app (show again)</button>
+              <button onClick={() => setAppPref(selected.agentId, selected.exe, selected.process, 'whitelist')}>Whitelist instead</button>
+            </div>
+          )}
+          <p style={{ fontSize: 12, color: '#94a3b8' }}>Applies to {selected.process} on {selected.agentName} only (executable path). Recordings are kept either way, so restoring loses nothing.</p>
           <h3>How to kill it</h3>
           {killCommands(selected).map(cmd => (
             <div key={cmd} style={{ fontFamily: 'monospace', fontSize: 13, marginBottom: 4 }}>{cmd} <button onClick={() => navigator.clipboard.writeText(cmd)}>Copy</button></div>

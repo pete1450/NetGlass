@@ -217,3 +217,17 @@ sketchy happening, and if so, what exactly is it?"
   that one IP, and is then cached for 30 days (Refresh forces a
   re-fetch). Private IPs are never sent to ip-api, and GET
   `/api/ip-info` only reads the cache — it never calls ip-api.
+- **Hide & whitelist apps (`/api/app-prefs`, `app_prefs` table):**
+  one preference per agent + executable path, set from a
+  connection's detail drawer. Hidden apps disappear from Agents,
+  Attention, counts and rule alerts, but are still collected and
+  recorded. Whitelisted apps stay visible but are never scored
+  (Score 0, no findings, never in Attention/Suspicious, no rule
+  alerts). Both take effect on the next agent snapshot (~2s) and
+  are reversible: per-app Restore or Hide/Whitelist-instead in
+  the drawer, a dedicated "Hidden & whitelisted" view with per-app
+  Restore/Switch plus Restore-all per kind, and a "Show hidden
+  apps" toggle on the Agents page that shows hidden rows muted
+  with a Hidden badge. Deleting an agent removes its prefs.
+  Apps with no executable path cannot be hidden/whitelisted —
+  an empty path would match every unknown process on the host.

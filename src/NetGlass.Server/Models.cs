@@ -20,7 +20,8 @@ public sealed record ConnectionDto(
     DateTime? Started, DateTime FirstSeen, DateTime LastSeen,
     bool IsGhost, bool IsNew, bool Suspicious, string[] Flags,
     string Detail = "", string Signature = "unknown",
-    int Score = 0, string Tier = "None", FindingDto[]? Findings = null);
+    int Score = 0, string Tier = "None", FindingDto[]? Findings = null,
+    bool IsWhitelisted = false, bool IsHidden = false);
 
 public sealed record SnapshotConnection(
     string Direction, string Proto, string State,

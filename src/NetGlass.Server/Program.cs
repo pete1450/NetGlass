@@ -52,6 +52,18 @@ using (var cmd = conn.CreateCommand())
         checkEnabled[reader.GetString(0)["check_enabled:".Length..]] = reader.GetString(1) != "0";
 }
 
+// App prefs (hide / whitelist), keyed "agentId|exe". Loaded at
+// startup and kept in memory so Ingest does no DB query per
+// connection; the API handlers below update both the DB and this
+// dictionary together.
+var appPrefKinds = new ConcurrentDictionary<string, string>();
+foreach (var (agentId, exe, _, kind, _) in recordings.ListAppPrefs())
+    appPrefKinds[$"{agentId}|{exe}"] = kind;
+bool IsAppWhitelisted(string agentId, string exe) =>
+    appPrefKinds.TryGetValue($"{agentId}|{exe}", out var k) && k == "whitelist";
+bool IsAppHidden(string agentId, string exe) =>
+    appPrefKinds.TryGetValue($"{agentId}|{exe}", out var k) && k == "hide";
+
 AgentInfo? AuthAgent(string id, HttpRequest req)
 {
     if (!agents.TryGetValue(id, out var agent)) return null;
@@ -107,6 +119,9 @@ app.MapDelete("/api/agents/{id}", (string id) =>
     using var conn = recordings.Open();
     conn.Execute("DELETE FROM agents WHERE id = $id", ("$id", id));
     conn.Execute("DELETE FROM kill_requests WHERE agent_id = $id", ("$id", id));
+    conn.Execute("DELETE FROM app_prefs WHERE agent_id = $id", ("$id", id));
+    foreach (var key in appPrefKinds.Keys.Where(k => k.StartsWith(id + "|")).ToList())
+        appPrefKinds.TryRemove(key, out _);
     conn.Execute("DELETE FROM seen_keys WHERE key LIKE $p", ("$p", id + "|%"));
     return Results.Ok(new { deleted = id });
 });
@@ -135,7 +150,8 @@ app.MapPost("/api/agents/{id}/snapshot", async (string id, SnapshotRequest snap,
         (key, t) => recordings.IsNewKey(key, t),
         key => recordings.IsFirstEver(key, now),
         id => checkEnabled.GetValueOrDefault(id, true),
-        ip => recordings.GetCachedIpInfo(ip));
+        ip => recordings.GetCachedIpInfo(ip),
+        IsAppWhitelisted, IsAppHidden);
 
     // Recordings: seen + closed events, in order.
     var recordingId = recordings.CurrentRecordingId();
@@ -165,6 +181,12 @@ app.MapPost("/api/agents/{id}/snapshot", async (string id, SnapshotRequest snap,
         {
             foreach (var c in live)
             {
+                // Hidden and whitelisted apps are trusted or out of
+                // sight by the user's explicit choice: they do not
+                // trigger rule alerts (or Apprise) either. Recordings
+                // still capture them, so restoring an app does not
+                // lose its history.
+                if (c.IsWhitelisted || c.IsHidden) continue;
                 var triggered = rule.Type switch
                 {
                     "NewListener" => c.Direction == "listen" && c.IsNew,
@@ -205,9 +227,14 @@ bool FrequencyTriggered(AlertRuleDto rule, ConnectionDto c, DateTime now)
 }
 
 // ---- live view ----------------------------------------------------------
-app.MapGet("/api/connections", (string? agent, string? direction) =>
+// Hidden apps are excluded by default; pass includeHidden=true to
+// see them (muted, with a Hidden badge) for review or restoring.
+// Counts are computed after the hidden filter, so the stats cards
+// never count apps the user chose to hide.
+app.MapGet("/api/connections", (string? agent, string? direction, bool? includeHidden) =>
 {
     var all = WithHosts(store.All(DateTime.UtcNow));
+    if (includeHidden != true) all = all.Where(c => !c.IsHidden).ToList();
     if (!string.IsNullOrWhiteSpace(agent)) all = all.Where(c => c.AgentId == agent).ToList();
     if (!string.IsNullOrWhiteSpace(direction)) all = all.Where(c => c.Direction == direction).ToList();
     return Results.Json(new { generated_at = DateTime.UtcNow, connections = all,
@@ -324,6 +351,43 @@ app.MapPost("/api/checks/{id}/toggle", (string id, JsonElement body) =>
     checkEnabled[id] = enabled;
     recordings.SetSetting($"check_enabled:{id}", enabled ? "1" : "0");
     return Results.Json(new { id, enabled });
+});
+
+// ---- app prefs: hide / whitelist ------------------------------------
+// One pref per agent + exe. Setting a pref replaces any existing
+// kind for that app; deleting it restores normal handling. The
+// agent name is resolved at read time, so a renamed agent still
+// shows its prefs. Apps with no executable path cannot be
+// hidden/whitelisted from the UI — their identity is unknown, and
+// an empty exe key would match every unknown process on the host.
+app.MapGet("/api/app-prefs", () =>
+{
+    var list = recordings.ListAppPrefs().Select(p => new
+    {
+        agentId = p.AgentId,
+        agentName = agents.TryGetValue(p.AgentId, out var ag) ? ag.Name : "",
+        exe = p.Exe, process = p.Process, kind = p.Kind, createdAt = p.CreatedAt,
+    });
+    return Results.Json(list);
+});
+app.MapPost("/api/app-prefs", (JsonElement body) =>
+{
+    var agentId = body.TryGetProperty("agentId", out var a) ? a.GetString() ?? "" : "";
+    var exe = body.TryGetProperty("exe", out var x) ? x.GetString() ?? "" : "";
+    var process = body.TryGetProperty("process", out var p) ? p.GetString() ?? "" : "";
+    var kind = body.TryGetProperty("kind", out var k) ? k.GetString() ?? "" : "";
+    if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrWhiteSpace(exe) ||
+        (kind != "hide" && kind != "whitelist"))
+        return Results.BadRequest(new { error = "agentId, a non-empty exe, and kind 'hide' or 'whitelist' are required." });
+    recordings.SetAppPref(agentId, exe, process, kind);
+    appPrefKinds[$"{agentId}|{exe}"] = kind;
+    return Results.Json(new { agentId, exe, process, kind });
+});
+app.MapDelete("/api/app-prefs", (string agentId, string exe) =>
+{
+    recordings.RemoveAppPref(agentId, exe);
+    appPrefKinds.TryRemove($"{agentId}|{exe}", out _);
+    return Results.Ok(new { restored = exe });
 });
 app.MapGet("/api/rules", () =>
 {
