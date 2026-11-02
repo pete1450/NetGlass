@@ -175,6 +175,24 @@ sketchy happening, and if so, what exactly is it?"
   (threat lists, WHOIS, GeoIP, byte counts) are documented as
   unavailable rather than faked; the threat-list check fires only
   against a user-supplied `NETGLASS_THREAT_LIST` file.
+- **Logo (user-supplied, 2026-11-01):** the real NetGlass logo
+  replaces the earlier SVG approximation in the sidebar
+  (`web/public/logo.png`, full 1254×1254 artwork, kept at full
+  resolution for the page). Favicon is a separate 64×64
+  downscale (`web/public/favicon.png`, linked in `index.html`),
+  plus a 180×180 Apple touch icon, so the tab icon does not
+  download the 1.4 MB artwork. Vite copies `public/` to `dist/`,
+  which the server Dockerfile copies to `wwwroot`, so both are
+  served by the server image.
+- **Sidebar background (user-supplied, 2026-11-01):** the Neon
+  Network on Deep Blue mockup artwork is the sidebar background
+  (`web/public/sidebar-bg.png`, scaled from 941×1672 to 460×817 —
+  2× the 230px sidebar, so it stays sharp at 304 KB instead of
+  1.4 MB). Anchored left-bottom so the network nodes sit at the
+  foot of the sidebar under the footer, with a dark gradient
+  overlay (35% top → 75% bottom) keeping nav text readable. On
+  mobile, where the sidebar becomes a top bar, the background is
+  replaced with a solid dark colour for readability.
 - **Delete agent (Agents panel, `DELETE /api/agents/{id}`):** two-click
   confirm in the UI. Revokes the agent's token, drops its live/ghost
   rows, and deletes its SQLite agent row, pending kill requests, and

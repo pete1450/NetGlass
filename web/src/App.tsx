@@ -341,19 +341,9 @@ export default function App() {
   return (
     <div className="ng-layout" style={{ display: 'flex', minHeight: '100vh', background: 'linear-gradient(160deg, #04091c 0%, #0a1930 60%, #071224 100%)', color: '#e2e8f0', fontFamily: 'system-ui, sans-serif' }}>
       {/* Sidebar, as in the reference screenshot */}
-      <aside className="ng-sidebar" style={{ width: 230, flexShrink: 0, padding: 20, borderRight: '1px solid #1e293b', background: 'rgba(4, 12, 28, 0.7)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <aside className="ng-sidebar" style={{ width: 230, flexShrink: 0, padding: 20, borderRight: '1px solid #1e293b', display: 'flex', flexDirection: 'column', gap: 8 }}>
         <div className="ng-logo" style={{ marginBottom: 12 }}>
-          <svg width="72" height="72" viewBox="0 0 72 72" aria-label="NetGlass logo">
-            <g stroke="#38bdf8" strokeWidth="1.5" opacity="0.9">
-              <line x1="14" y1="14" x2="36" y2="26" /><line x1="58" y1="14" x2="36" y2="26" />
-              <line x1="14" y1="58" x2="36" y2="26" /><line x1="58" y1="58" x2="36" y2="26" />
-            </g>
-            <circle cx="14" cy="14" r="4" fill="#38bdf8" /><circle cx="58" cy="14" r="4" fill="#38bdf8" />
-            <circle cx="14" cy="58" r="4" fill="#38bdf8" /><circle cx="58" cy="58" r="4" fill="#38bdf8" />
-            <circle cx="42" cy="32" r="18" fill="none" stroke="#38bdf8" strokeWidth="3" />
-            <line x1="55" y1="45" x2="66" y2="56" stroke="#38bdf8" strokeWidth="4" strokeLinecap="round" />
-            <text x="42" y="40" textAnchor="middle" fontSize="22" fontWeight="800" fill="#e2e8f0">N</text>
-          </svg>
+          <img src="/logo.png" width="72" height="72" alt="NetGlass logo" style={{ borderRadius: 16, display: "block" }} />
           <div style={{ fontSize: 26, fontWeight: 800, marginTop: 4 }}>Net<span style={{ color: '#22d3ee' }}>Glass</span></div>
         </div>
         <div className="ng-nav" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
