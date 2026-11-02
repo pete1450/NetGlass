@@ -686,7 +686,12 @@ static class Collector
                 string name = "(unknown)", exe = "", parentName = "", parentExe = "";
                 int? ppid = null;
                 DateTime? started = null;
-                try
+                // PID 0 is the System Idle Process. Process.GetProcessById
+                // cannot open it on Windows, so without this special case
+                // its rows arrive as "(unknown)" with no exe — and no
+                // usable identity to hide or whitelist them by.
+                if (pid == 0) name = "Idle";
+                else try
                 {
                     var proc = Process.GetProcessById(pid);
                     name = proc.ProcessName;

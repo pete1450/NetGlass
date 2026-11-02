@@ -44,13 +44,28 @@ public sealed class ConnectionStore
         };
     }
 
+    // App identity for hide/whitelist prefs. An executable path
+    // when there is one; otherwise the process name — kernel and
+    // system processes (Windows Idle, Linux kernel threads) have
+    // no executable path by design, and blocking them from being
+    // hidden was the whole problem. Only a row with neither an
+    // exe nor a real process name is unidentifiable: its identity
+    // is "", and no pref can match it, because matching "" would
+    // hide every unknown row on the host at once.
+    public static string AppIdentity(string exe, string process)
+    {
+        if (!string.IsNullOrWhiteSpace(exe)) return "exe:" + exe;
+        if (!string.IsNullOrWhiteSpace(process) && process != "(unknown)") return "proc:" + process;
+        return "";
+    }
+
     public (List<ConnectionDto> Live, List<string> ClosedKeys) Ingest(
         AgentInfo agent, SnapshotRequest snapshot, DateTime now,
         Func<string, DateTime, bool> isNew, Func<string, bool> isFirstEver,
         Func<string, bool> isCheckEnabled,
         Func<string, (string Country, string Asn)?> cachedIp,
-        Func<string, string, bool> isWhitelisted,
-        Func<string, string, bool> isHidden)
+        Func<string, bool> isWhitelisted,
+        Func<string, bool> isHidden)
     {
         var previousLiveKeys = _entries.Where(kv => kv.Value.Conn.AgentId == agent.Id && kv.Value.Live)
             .Select(kv => kv.Key).ToHashSet();
@@ -93,9 +108,11 @@ public sealed class ConnectionStore
             // or whitelisting an app takes effect on the next snapshot
             // (within the agent's interval, ~2s) and restoring it
             // brings its live rows back with their flags intact.
-            var appHidden = isHidden(agent.Id, c.Exe);
-            var appWhitelisted = isWhitelisted(agent.Id, c.Exe);
-            dto = dto with { IsHidden = appHidden, IsWhitelisted = appWhitelisted };
+            var appIdentity = AppIdentity(c.Exe, c.Process);
+            var appKey = $"{agent.Id}|{appIdentity}";
+            var appHidden = appIdentity != "" && isHidden(appKey);
+            var appWhitelisted = appIdentity != "" && isWhitelisted(appKey);
+            dto = dto with { Identity = appIdentity, IsHidden = appHidden, IsWhitelisted = appWhitelisted };
             if (appWhitelisted)
                 dto = dto with { Score = 0, Tier = "None", Findings = Array.Empty<FindingDto>() };
             if (_entries.TryGetValue(key, out var existing))
@@ -106,7 +123,7 @@ public sealed class ConnectionStore
                     Pid = c.Pid, Process = c.Process, Cmdline = c.Cmdline,
                     Detail = string.IsNullOrEmpty(c.Detail) ? existing.Conn.Detail : c.Detail,
                     Signature = c.Signature is null or "unknown" ? existing.Conn.Signature : c.Signature,
-                    IsHidden = appHidden, IsWhitelisted = appWhitelisted,
+                    Identity = appIdentity, IsHidden = appHidden, IsWhitelisted = appWhitelisted,
                     Score = appWhitelisted ? 0 : existing.Conn.Score,
                     Tier = appWhitelisted ? "None" : existing.Conn.Tier,
                     Findings = appWhitelisted ? Array.Empty<FindingDto>() : existing.Conn.Findings,
@@ -148,10 +165,13 @@ public sealed class ConnectionStore
         foreach (var key in closed)
         {
             if (!_entries.TryGetValue(key, out var entry)) continue;
+            var ghostIdentity = AppIdentity(entry.Conn.Exe, entry.Conn.Process);
+            var ghostKey = $"{entry.Conn.AgentId}|{ghostIdentity}";
             var ghost = entry.Conn with
             {
-                IsHidden = isHidden(entry.Conn.AgentId, entry.Conn.Exe),
-                IsWhitelisted = isWhitelisted(entry.Conn.AgentId, entry.Conn.Exe),
+                Identity = ghostIdentity,
+                IsHidden = ghostIdentity != "" && isHidden(ghostKey),
+                IsWhitelisted = ghostIdentity != "" && isWhitelisted(ghostKey),
             };
             entry.Conn = ghost.IsWhitelisted
                 ? ghost with { Score = 0, Tier = "None", Findings = Array.Empty<FindingDto>() }
@@ -215,8 +235,36 @@ public sealed class RecordingStore
             CREATE TABLE IF NOT EXISTS seen_keys(key TEXT PRIMARY KEY, first_seen TEXT);
             CREATE TABLE IF NOT EXISTS baselines(key TEXT PRIMARY KEY, first_seen TEXT);
             CREATE TABLE IF NOT EXISTS dns_cache(ip TEXT PRIMARY KEY, hostname TEXT, source TEXT, resolved_at TEXT, expires_at TEXT);
-            CREATE TABLE IF NOT EXISTS app_prefs(agent_id TEXT, exe TEXT, process TEXT, kind TEXT, created_at TEXT, PRIMARY KEY (agent_id, exe));
+            CREATE TABLE IF NOT EXISTS app_prefs(agent_id TEXT, identity TEXT, exe TEXT, process TEXT, kind TEXT, created_at TEXT, PRIMARY KEY (agent_id, identity));
             CREATE TABLE IF NOT EXISTS ip_info_cache(ip TEXT PRIMARY KEY, isp TEXT, org TEXT, asn TEXT, country TEXT, country_code TEXT, region TEXT, city TEXT, timezone TEXT, reverse TEXT, fetched_at TEXT, expires_at TEXT);");
+        MigrateAppPrefs();
+    }
+
+    // Older servers created app_prefs keyed by (agent_id, exe) with
+    // no identity column. Rebuild it keyed by (agent_id, identity),
+    // backfilling identity from the stored exe path, so existing
+    // hide/whitelist prefs survive the rework. Fresh databases
+    // already have the new schema and skip this entirely.
+    private void MigrateAppPrefs()
+    {
+        var hasIdentity = false;
+        using (var checkConn = Open())
+        using (var checkCmd = checkConn.CreateCommand())
+        {
+            checkCmd.CommandText = "PRAGMA table_info(app_prefs)";
+            using var checkReader = checkCmd.ExecuteReader();
+            while (checkReader.Read())
+                if (checkReader.GetString(1) == "identity") hasIdentity = true;
+        }
+        if (hasIdentity) return;
+        using var migConn = Open();
+        migConn.Execute("CREATE TABLE app_prefs_new(agent_id TEXT, identity TEXT, exe TEXT, process TEXT, kind TEXT, created_at TEXT, PRIMARY KEY (agent_id, identity))");
+        migConn.Execute(@"INSERT INTO app_prefs_new
+            SELECT agent_id,
+                CASE WHEN exe <> '' THEN 'exe:' || exe ELSE 'proc:' || process END,
+                exe, process, kind, created_at FROM app_prefs");
+        migConn.Execute("DROP TABLE app_prefs");
+        migConn.Execute("ALTER TABLE app_prefs_new RENAME TO app_prefs");
     }
 
     public SqliteConnection Open()
@@ -426,39 +474,41 @@ public sealed class RecordingStore
             ("$k", key), ("$v", value));
     }
 
-    // ---- App prefs: hide / whitelist, one per agent + exe -----------
-    // kind is 'hide' or 'whitelist'. An app has at most one pref:
-    // setting a new kind replaces the old one, and deleting the pref
-    // restores the app to normal handling. Nothing is deleted here:
-    // live rows, recordings, alerts and baselines are all kept, so
-    // restoring an app brings it back with its history intact.
-    public List<(string AgentId, string Exe, string Process, string Kind, string CreatedAt)> ListAppPrefs()
+    // ---- App prefs: hide / whitelist, one per agent + identity ----
+    // Identity is the exe path when there is one, else the process
+    // name (see ConnectionStore.AppIdentity). Kind is 'hide' or
+    // 'whitelist'. An app has at most one pref: setting a new kind
+    // replaces the old one, and deleting the pref restores the app
+    // to normal handling. Nothing is deleted here: live rows,
+    // recordings, alerts and baselines are all kept, so restoring
+    // an app brings it back with its history intact.
+    public List<(string AgentId, string Identity, string Exe, string Process, string Kind, string CreatedAt)> ListAppPrefs()
     {
         using var conn = Open();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT agent_id, exe, process, kind, created_at FROM app_prefs ORDER BY kind, process, agent_id";
+        cmd.CommandText = "SELECT agent_id, identity, exe, process, kind, created_at FROM app_prefs ORDER BY kind, process, agent_id";
         using var reader = cmd.ExecuteReader();
-        var list = new List<(string, string, string, string, string)>();
+        var list = new List<(string, string, string, string, string, string)>();
         while (reader.Read())
             list.Add((reader.GetString(0), reader.GetString(1), reader.GetString(2),
-                reader.GetString(3), reader.GetString(4)));
+                reader.GetString(3), reader.GetString(4), reader.GetString(5)));
         return list;
     }
 
-    public void SetAppPref(string agentId, string exe, string process, string kind)
+    public void SetAppPref(string agentId, string identity, string exe, string process, string kind)
     {
         using var conn = Open();
-        conn.Execute(@"INSERT INTO app_prefs VALUES ($a, $x, $p, $k, $t)
-            ON CONFLICT(agent_id, exe) DO UPDATE SET process = $p, kind = $k, created_at = $t",
-            ("$a", agentId), ("$x", exe), ("$p", process), ("$k", kind),
+        conn.Execute(@"INSERT INTO app_prefs VALUES ($a, $i, $x, $p, $k, $t)
+            ON CONFLICT(agent_id, identity) DO UPDATE SET exe = $x, process = $p, kind = $k, created_at = $t",
+            ("$a", agentId), ("$i", identity), ("$x", exe), ("$p", process), ("$k", kind),
             ("$t", DateTime.UtcNow.ToString("O")));
     }
 
-    public void RemoveAppPref(string agentId, string exe)
+    public void RemoveAppPref(string agentId, string identity)
     {
         using var conn = Open();
-        conn.Execute("DELETE FROM app_prefs WHERE agent_id = $a AND exe = $x",
-            ("$a", agentId), ("$x", exe));
+        conn.Execute("DELETE FROM app_prefs WHERE agent_id = $a AND identity = $i",
+            ("$a", agentId), ("$i", identity));
     }
 
     // ---- DNS / IP-info cache -------------------------------------------

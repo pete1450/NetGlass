@@ -21,7 +21,7 @@ public sealed record ConnectionDto(
     bool IsGhost, bool IsNew, bool Suspicious, string[] Flags,
     string Detail = "", string Signature = "unknown",
     int Score = 0, string Tier = "None", FindingDto[]? Findings = null,
-    bool IsWhitelisted = false, bool IsHidden = false);
+    bool IsWhitelisted = false, bool IsHidden = false, string Identity = "");
 
 public sealed record SnapshotConnection(
     string Direction, string Proto, string State,

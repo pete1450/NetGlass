@@ -11,8 +11,20 @@ type Conn = {
   detail?: string; signature?: string
   score?: number; tier?: string; findings?: Finding[]
   isWhitelisted?: boolean; isHidden?: boolean
+  identity?: string
 }
-type AppPref = { agentId: string; agentName: string; exe: string; process: string; kind: string; createdAt: string }
+type AppPref = { agentId: string; agentName: string; identity: string; exe: string; process: string; kind: string; createdAt: string }
+
+// App identity, mirroring the server (ConnectionStore.AppIdentity):
+// executable path when there is one, else the process name, else
+// '' (unidentifiable). The server sends identity directly; the
+// fallbacks here cover rows from an older server build.
+function appIdentityFor(c: { identity?: string; exe: string; process: string }): string {
+  if (c.identity) return c.identity
+  if (c.exe) return `exe:${c.exe}`
+  if (c.process && c.process !== '(unknown)') return `proc:${c.process}`
+  return ''
+}
 type Finding = {
   ruleId: string; title: string; category: string; engine: string
   severity: string; score: number; evidence: string; explanation: string
@@ -243,27 +255,29 @@ export default function App() {
 
   // Hide / whitelist actions. Identity is agent + exe path, so
   // hiding an app on one host does not affect the same app on
-  // another. Apps with no exe path cannot be acted on: an empty
-  // exe key would match every unknown process on that host.
+  // another. Identity is the exe path, or the process name when
+  // there is no path (Idle, kernel threads) — so exe-less rows
+  // can be acted on. Only a row with neither is unidentifiable,
+  // and matching it would hide every unknown row on that host.
   // Restoring is a DELETE of the pref; it takes effect on the
   // next agent snapshot (~2s), with history intact.
-  async function setAppPref(agentId: string, exe: string, process: string, kind: 'hide' | 'whitelist') {
-    const res = await fetch('/api/app-prefs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agentId, exe, process, kind }) })
+  async function setAppPref(agentId: string, identity: string, exe: string, process: string, kind: 'hide' | 'whitelist') {
+    const res = await fetch('/api/app-prefs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agentId, identity, exe, process, kind }) })
     if (!res.ok) { setPrefStatus('Could not save that preference.'); return }
     setPrefStatus(kind === 'hide'
       ? `Hidden ${process || exe} — its connections will disappear from Agents, Attention and alerts on the next snapshot. Recordings are kept, and you can restore it from Hidden & whitelisted.`
       : `Whitelisted ${process || exe} — its connections stay visible but are no longer scored and will not appear in Attention or trigger alerts.`)
     setSelected(null); load()
   }
-  async function clearAppPref(agentId: string, exe: string, process: string) {
-    await fetch(`/api/app-prefs?agentId=${encodeURIComponent(agentId)}&exe=${encodeURIComponent(exe)}`, { method: 'DELETE' })
+  async function clearAppPref(agentId: string, identity: string, process: string, exe: string) {
+    await fetch(`/api/app-prefs?agentId=${encodeURIComponent(agentId)}&identity=${encodeURIComponent(identity)}`, { method: 'DELETE' })
     setPrefStatus(`Restored ${process || exe} — normal scoring and display resume on the next snapshot.`)
     setSelected(null); load()
   }
   async function restoreAllPrefs(kind: 'hide' | 'whitelist') {
     const targets = appPrefs.filter(p => p.kind === kind)
     for (const p of targets)
-      await fetch(`/api/app-prefs?agentId=${encodeURIComponent(p.agentId)}&exe=${encodeURIComponent(p.exe)}`, { method: 'DELETE' })
+      await fetch(`/api/app-prefs?agentId=${encodeURIComponent(p.agentId)}&identity=${encodeURIComponent(p.identity || appIdentityFor(p))}`, { method: 'DELETE' })
     setPrefStatus(targets.length
       ? `Restored all ${targets.length} ${kind === 'hide' ? 'hidden' : 'whitelisted'} app${targets.length === 1 ? '' : 's'}.`
       : `Nothing to restore.`)
@@ -679,7 +693,8 @@ export default function App() {
             Nothing here is deleted. <strong>Hidden</strong> apps disappear from Agents, Attention, counts and rule alerts, but are still
             collected and recorded — restoring one brings it back with its history intact. <strong>Whitelisted</strong> apps stay visible,
             but their connections are never scored, never appear in Attention, and never trigger rule alerts. Use whitelist for known-good
-            noisy apps, hide for apps you simply do not want to look at. A preference applies to one agent + executable path only, so the
+            noisy apps, hide for apps you simply do not want to look at. A preference applies to one agent + app identity only — the
+            executable path when there is one, or the process name when there is not (Idle, kernel threads) — so the
             same app on another host is unaffected. Changes take effect on the next agent snapshot (about 2 seconds).
           </p>
           {prefStatus && <div style={{ marginBottom: 12 }}>{prefStatus}</div>}
@@ -692,12 +707,12 @@ export default function App() {
                 </p>
               )}
               {appPrefs.filter(p => p.kind === kind).map(p => (
-                <div key={`${p.agentId}|${p.exe}`} style={{ border: '1px solid #1e3a5f', borderRadius: 8, padding: 10, marginBottom: 8, fontSize: 13 }}>
+                <div key={`${p.agentId}|${p.identity || appIdentityFor(p)}`} style={{ border: '1px solid #1e3a5f', borderRadius: 8, padding: 10, marginBottom: 8, fontSize: 13 }}>
                   <strong>{p.process || p.exe}</strong> <span style={{ color: '#94a3b8' }}>on {p.agentName || p.agentId.slice(0, 8)} · since {p.createdAt ? new Date(p.createdAt).toLocaleString() : ''}</span>
-                  <div style={{ overflowWrap: 'anywhere', color: '#94a3b8', marginTop: 4 }}>{p.exe}</div>
+                  <div style={{ overflowWrap: 'anywhere', color: '#94a3b8', marginTop: 4 }}>{p.exe ? p.exe : `Process name “${p.process}” — no executable path, matched by name`}</div>
                   <div style={{ marginTop: 6, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                    <button onClick={() => clearAppPref(p.agentId, p.exe, p.process)}>Restore app</button>
-                    <button onClick={() => setAppPref(p.agentId, p.exe, p.process, kind === 'hide' ? 'whitelist' : 'hide')}>
+                    <button onClick={() => clearAppPref(p.agentId, p.identity || appIdentityFor(p), p.process, p.exe)}>Restore app</button>
+                    <button onClick={() => setAppPref(p.agentId, p.identity || appIdentityFor(p), p.exe, p.process, kind === 'hide' ? 'whitelist' : 'hide')}>
                       {kind === 'hide' ? 'Whitelist instead' : 'Hide instead'}
                     </button>
                   </div>
@@ -834,26 +849,27 @@ export default function App() {
           <h3>Hide or whitelist this app</h3>
           {selected.isWhitelisted && <p style={{ fontSize: 13, color: '#34d399' }}>This app is whitelisted — its connections are not scored and will not appear in Attention or trigger alerts.</p>}
           {selected.isHidden && <p style={{ fontSize: 13, color: '#94a3b8' }}>This app is hidden — it only appears here because “Show hidden apps” is on.</p>}
-          {!selected.exe && <p style={{ fontSize: 13, color: '#94a3b8' }}>This app has no executable path, so it cannot be hidden or whitelisted — an empty path would match every unknown process on this host.</p>}
-          {selected.exe && !selected.isWhitelisted && !selected.isHidden && (
+          {!appIdentityFor(selected) && <p style={{ fontSize: 13, color: '#94a3b8' }}>This row has neither an executable path nor a process name, so it cannot be distinguished from other unknown rows — hiding it would hide all unknown rows on this host.</p>}
+          {!selected.exe && appIdentityFor(selected) && <p style={{ fontSize: 13, color: '#94a3b8' }}>No executable path for this app, so it is matched by process name (“{selected.process}”) on this host. That covers every row for that name here — exactly what you want for Idle — but it is broader than an executable path.</p>}
+          {appIdentityFor(selected) && !selected.isWhitelisted && !selected.isHidden && (
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-              <button onClick={() => setAppPref(selected.agentId, selected.exe, selected.process, 'hide')}>Hide this app</button>
-              <button onClick={() => setAppPref(selected.agentId, selected.exe, selected.process, 'whitelist')}>Whitelist this app</button>
+              <button onClick={() => setAppPref(selected.agentId, appIdentityFor(selected), selected.exe, selected.process, 'hide')}>Hide this app</button>
+              <button onClick={() => setAppPref(selected.agentId, appIdentityFor(selected), selected.exe, selected.process, 'whitelist')}>Whitelist this app</button>
             </div>
           )}
-          {selected.exe && selected.isWhitelisted && (
+          {appIdentityFor(selected) && selected.isWhitelisted && (
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-              <button onClick={() => clearAppPref(selected.agentId, selected.exe, selected.process)}>Restore app (resume scoring)</button>
-              <button onClick={() => setAppPref(selected.agentId, selected.exe, selected.process, 'hide')}>Hide instead</button>
+              <button onClick={() => clearAppPref(selected.agentId, appIdentityFor(selected), selected.process, selected.exe)}>Restore app (resume scoring)</button>
+              <button onClick={() => setAppPref(selected.agentId, appIdentityFor(selected), selected.exe, selected.process, 'hide')}>Hide instead</button>
             </div>
           )}
-          {selected.exe && selected.isHidden && (
+          {appIdentityFor(selected) && selected.isHidden && (
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-              <button onClick={() => clearAppPref(selected.agentId, selected.exe, selected.process)}>Restore app (show again)</button>
-              <button onClick={() => setAppPref(selected.agentId, selected.exe, selected.process, 'whitelist')}>Whitelist instead</button>
+              <button onClick={() => clearAppPref(selected.agentId, appIdentityFor(selected), selected.process, selected.exe)}>Restore app (show again)</button>
+              <button onClick={() => setAppPref(selected.agentId, appIdentityFor(selected), selected.exe, selected.process, 'whitelist')}>Whitelist instead</button>
             </div>
           )}
-          <p style={{ fontSize: 12, color: '#94a3b8' }}>Applies to {selected.process} on {selected.agentName} only (executable path). Recordings are kept either way, so restoring loses nothing.</p>
+          <p style={{ fontSize: 12, color: '#94a3b8' }}>Applies to {selected.process} on {selected.agentName} only{selected.exe ? ' (executable path)' : ' (process name)'}. Recordings are kept either way, so restoring loses nothing.</p>
           <h3>How to kill it</h3>
           {killCommands(selected).map(cmd => (
             <div key={cmd} style={{ fontFamily: 'monospace', fontSize: 13, marginBottom: 4 }}>{cmd} <button onClick={() => navigator.clipboard.writeText(cmd)}>Copy</button></div>

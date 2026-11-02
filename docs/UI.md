@@ -218,10 +218,15 @@ sketchy happening, and if so, what exactly is it?"
   re-fetch). Private IPs are never sent to ip-api, and GET
   `/api/ip-info` only reads the cache — it never calls ip-api.
 - **Hide & whitelist apps (`/api/app-prefs`, `app_prefs` table):**
-  one preference per agent + executable path, set from a
-  connection's detail drawer. Hidden apps disappear from Agents,
-  Attention, counts and rule alerts, but are still collected and
-  recorded. Whitelisted apps stay visible but are never scored
+  one preference per agent + app identity, set from a
+  connection's detail drawer. Identity is the executable path
+  when there is one, else the process name — so exe-less system
+  processes (Windows Idle, kernel threads) can be hidden or
+  whitelisted too, matched by name on that host only. The Windows
+  agent reports PID 0 as "Idle" so those rows carry a name to
+  match on. Hidden apps disappear from Agents, Attention, counts
+  and rule alerts, but are still collected and recorded.
+  Whitelisted apps stay visible but are never scored
   (Score 0, no findings, never in Attention/Suspicious, no rule
   alerts). Both take effect on the next agent snapshot (~2s) and
   are reversible: per-app Restore or Hide/Whitelist-instead in
@@ -229,5 +234,8 @@ sketchy happening, and if so, what exactly is it?"
   Restore/Switch plus Restore-all per kind, and a "Show hidden
   apps" toggle on the Agents page that shows hidden rows muted
   with a Hidden badge. Deleting an agent removes its prefs.
-  Apps with no executable path cannot be hidden/whitelisted —
-  an empty path would match every unknown process on the host.
+  Existing prefs survive the rework: the server migrates the
+  old (agent, exe) table to (agent, identity) on startup,
+  backfilling identity from the stored exe path. Only a row with
+  neither an exe nor a real process name is unidentifiable —
+  matching it would hide every unknown row on the host at once.

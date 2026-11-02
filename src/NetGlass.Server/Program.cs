@@ -52,17 +52,18 @@ using (var cmd = conn.CreateCommand())
         checkEnabled[reader.GetString(0)["check_enabled:".Length..]] = reader.GetString(1) != "0";
 }
 
-// App prefs (hide / whitelist), keyed "agentId|exe". Loaded at
-// startup and kept in memory so Ingest does no DB query per
-// connection; the API handlers below update both the DB and this
-// dictionary together.
+// App prefs (hide / whitelist), keyed "agentId|identity" where
+// identity is "exe:<path>" or "proc:<name>" (see
+// ConnectionStore.AppIdentity). Loaded at startup and kept in
+// memory so Ingest does no DB query per connection; the API
+// handlers below update both the DB and this dictionary together.
 var appPrefKinds = new ConcurrentDictionary<string, string>();
-foreach (var (agentId, exe, _, kind, _) in recordings.ListAppPrefs())
-    appPrefKinds[$"{agentId}|{exe}"] = kind;
-bool IsAppWhitelisted(string agentId, string exe) =>
-    appPrefKinds.TryGetValue($"{agentId}|{exe}", out var k) && k == "whitelist";
-bool IsAppHidden(string agentId, string exe) =>
-    appPrefKinds.TryGetValue($"{agentId}|{exe}", out var k) && k == "hide";
+foreach (var (agentId, identity, _, _, kind, _) in recordings.ListAppPrefs())
+    appPrefKinds[$"{agentId}|{identity}"] = kind;
+bool IsAppWhitelisted(string key) =>
+    appPrefKinds.TryGetValue(key, out var k) && k == "whitelist";
+bool IsAppHidden(string key) =>
+    appPrefKinds.TryGetValue(key, out var k) && k == "hide";
 
 AgentInfo? AuthAgent(string id, HttpRequest req)
 {
@@ -354,19 +355,22 @@ app.MapPost("/api/checks/{id}/toggle", (string id, JsonElement body) =>
 });
 
 // ---- app prefs: hide / whitelist ------------------------------------
-// One pref per agent + exe. Setting a pref replaces any existing
-// kind for that app; deleting it restores normal handling. The
-// agent name is resolved at read time, so a renamed agent still
-// shows its prefs. Apps with no executable path cannot be
-// hidden/whitelisted from the UI — their identity is unknown, and
-// an empty exe key would match every unknown process on the host.
+// One pref per agent + app identity. Identity is the exe path
+// when there is one, else the process name, so exe-less system
+// processes (Windows Idle, kernel threads) can be hidden or
+// whitelisted too. Setting a pref replaces any existing kind for
+// that app; deleting it restores normal handling. The agent name
+// is resolved at read time, so a renamed agent still shows its
+// prefs. Only a row with neither an exe nor a real process name
+// is unidentifiable — matching it would hide every unknown row
+// on the host at once, so the API rejects it.
 app.MapGet("/api/app-prefs", () =>
 {
     var list = recordings.ListAppPrefs().Select(p => new
     {
         agentId = p.AgentId,
         agentName = agents.TryGetValue(p.AgentId, out var ag) ? ag.Name : "",
-        exe = p.Exe, process = p.Process, kind = p.Kind, createdAt = p.CreatedAt,
+        identity = p.Identity, exe = p.Exe, process = p.Process, kind = p.Kind, createdAt = p.CreatedAt,
     });
     return Results.Json(list);
 });
@@ -376,18 +380,23 @@ app.MapPost("/api/app-prefs", (JsonElement body) =>
     var exe = body.TryGetProperty("exe", out var x) ? x.GetString() ?? "" : "";
     var process = body.TryGetProperty("process", out var p) ? p.GetString() ?? "" : "";
     var kind = body.TryGetProperty("kind", out var k) ? k.GetString() ?? "" : "";
-    if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrWhiteSpace(exe) ||
+    var identity = body.TryGetProperty("identity", out var i) && !string.IsNullOrWhiteSpace(i.GetString())
+        ? i.GetString()! : NetGlass.Server.ConnectionStore.AppIdentity(exe, process);
+    if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrWhiteSpace(identity) ||
         (kind != "hide" && kind != "whitelist"))
-        return Results.BadRequest(new { error = "agentId, a non-empty exe, and kind 'hide' or 'whitelist' are required." });
-    recordings.SetAppPref(agentId, exe, process, kind);
-    appPrefKinds[$"{agentId}|{exe}"] = kind;
-    return Results.Json(new { agentId, exe, process, kind });
+        return Results.BadRequest(new { error = "agentId, kind 'hide' or 'whitelist', and an app identity (an executable path or a process name) are required. A row with neither cannot be distinguished from other unknown rows." });
+    recordings.SetAppPref(agentId, identity, exe, process, kind);
+    appPrefKinds[$"{agentId}|{identity}"] = kind;
+    return Results.Json(new { agentId, identity, exe, process, kind });
 });
-app.MapDelete("/api/app-prefs", (string agentId, string exe) =>
+app.MapDelete("/api/app-prefs", (string agentId, string? identity, string? exe) =>
 {
-    recordings.RemoveAppPref(agentId, exe);
-    appPrefKinds.TryRemove($"{agentId}|{exe}", out _);
-    return Results.Ok(new { restored = exe });
+    var id = !string.IsNullOrWhiteSpace(identity) ? identity!
+        : (!string.IsNullOrWhiteSpace(exe) ? "exe:" + exe : "");
+    if (string.IsNullOrWhiteSpace(id)) return Results.BadRequest(new { error = "identity (or a legacy exe) is required." });
+    recordings.RemoveAppPref(agentId, id);
+    appPrefKinds.TryRemove($"{agentId}|{id}", out _);
+    return Results.Ok(new { restored = id });
 });
 app.MapGet("/api/rules", () =>
 {
